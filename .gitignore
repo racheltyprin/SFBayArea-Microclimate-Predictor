@@ -1,0 +1,24 @@
+# Environment / secrets
+.env
+*.env
+
+# AWS credentials & access keys — never commit these
+*accessKeys.csv
+keys
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Data files — stored in S3, not git
+*.parquet
+*.csv
