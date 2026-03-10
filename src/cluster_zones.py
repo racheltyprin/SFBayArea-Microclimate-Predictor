@@ -26,22 +26,16 @@ CURRENT DATA SOURCE COVERAGE — SYNOPTIC ONLY:
     (~1,124 stations, 1 year). This provides reasonable geographic coverage
     of the Bay Area but is sparse in residential neighborhoods.
 
-    TODO (WU): When WU data is available, load observations from:
-        s3://bay-area-microclimate/raw/wunderground/monthly/
+    TODO (Open-Meteo): When Open-Meteo dense grid data is available, load from:
+        s3://bay-area-microclimate/raw/open_meteo/monthly/
     Merge with Synoptic observations before building the feature matrix.
-    WU's much denser station network (potentially 5,000–10,000 stations)
-    will sharpen zone boundaries significantly, particularly along the
-    coastal fog gradient and in hillside neighborhoods.
-
-    Key consideration: WU stations have variable data quality. Before merging,
-    apply an outlier filter per station (e.g., flag stations whose annual mean
-    temp deviates > 3 std from nearest Synoptic anchor station) and exclude
-    those from the clustering feature matrix.
+    The dense grid (~961 points at 0.05° spacing) will sharpen zone
+    boundaries significantly, particularly along the coastal fog gradient.
 
 S3 layout:
     Input:
         raw/synoptic/monthly/YYYY-MM/chunk_XXXX.parquet
-        [TODO: raw/wunderground/monthly/YYYY-MM/{stid}.parquet]
+        [TODO: raw/open_meteo/monthly/YYYY-MM/grid_{lat}_{lon}.parquet]
         features/static/stations_with_features.parquet
     Output:
         features/zones/zone_assignments.parquet   ← stid → zone_id + zone metadata
@@ -139,17 +133,14 @@ def load_all_observations() -> pd.DataFrame:
     Load observations from all available data sources.
     Currently: Synoptic only.
 
-    TODO (WU): When WU data is available, also load:
-        keys = list_s3_keys("raw/wunderground/monthly/")
-        wu_frames = [load_parquet_from_s3(k)[["datetime","stid","temp_c","humidity"]]
+    TODO (Open-Meteo): When Open-Meteo data is available, also load:
+        keys = list_s3_keys("raw/open_meteo/monthly/")
+        om_frames = [load_parquet_from_s3(k)[["datetime","stid","temp_c","humidity"]]
                      for k in keys]
-        wu_obs = pd.concat(wu_frames, ignore_index=True)
-        wu_obs["source"] = "wunderground"
+        om_obs = pd.concat(om_frames, ignore_index=True)
+        om_obs["source"] = "open_meteo"
 
-        Before merging, filter low-quality WU stations:
-        wu_obs = filter_wu_outlier_stations(wu_obs, synoptic_obs)
-
-        obs = pd.concat([synoptic_obs, wu_obs], ignore_index=True)
+        obs = pd.concat([synoptic_obs, om_obs], ignore_index=True)
 
     WU data will dramatically improve zone boundary sharpness, especially in:
     - The coastal fog gradient (Half Moon Bay → San Jose)

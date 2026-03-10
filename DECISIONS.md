@@ -70,7 +70,7 @@ The Weather Underground pipeline (`src/download_wunderground.py`) was abandoned 
 - Deterministic grid coverage (no station discovery step, no gaps)
 
 **Status (2026-03-10)**
-`src/download_openmeteo_dense.py` is written and ready to run. Follows the same pattern as `download_era5.py` but at much higher spatial resolution. Has not been executed yet.
+`src/download_open_meteo.py` is written and ready to run. Follows the same pattern as `download_era5.py` but at much higher spatial resolution. Has not been executed yet.
 
 **Grid resolution: 0.05° (~5km) (2026-03-10)**
 Dense grid at 0.05° spacing gives ~900 grid points across the Bay Area bbox. This is 25x denser than the ERA5 grid (36 points at 0.25°) and provides fine-grained spatial variation needed for microclimate modeling. The underlying ERA5 reanalysis is 0.25° native, so Open-Meteo interpolates — but the interpolated values still capture local terrain effects through the model's orography.
@@ -79,7 +79,7 @@ Dense grid at 0.05° spacing gives ~900 grid points across the Bay Area bbox. Th
 `temperature_2m`, `relative_humidity_2m`, `wind_speed_10m`, `wind_direction_10m`, `precipitation`, `cloud_cover`, `surface_pressure`. These complement ERA5's synoptic-scale variables (boundary layer height, 850hPa temperature) with local surface detail.
 
 **S3 layout: per-grid-point per month (2026-03-10)**
-`raw/openmeteo_dense/monthly/YYYY-MM/grid_{lat}_{lon}.parquet` — matches the ERA5 layout for consistency. Resumable via S3 key existence checks.
+`raw/open_meteo/monthly/YYYY-MM/grid_{lat}_{lon}.parquet` — matches the ERA5 layout for consistency. Resumable via S3 key existence checks.
 
 **Tradeoff vs. real station observations (2026-03-10)**
 Open-Meteo dense grid data is model output, not direct observations. It will not capture hyper-local effects (street-level heat islands, building shadows, irrigation cooling) that real PWS data would. However, the consistent quality and coverage make it a better foundation for the model-first workflow — the model can learn spatial patterns from the dense grid, and Synoptic ASOS stations provide ground-truth calibration.
@@ -161,13 +161,13 @@ Stations with < 500 observations excluded from clustering. 500 obs ≈ 3 weeks o
 ## Schema
 
 **`source` column (2026-03-02, updated 2026-03-10)**
-All observation parquets include `source` (`"synoptic"` or `"openmeteo_dense"`). Allows filtering, differential weighting, or source-specific validation downstream.
+All observation parquets include `source` (`"synoptic"` or `"open_meteo"`). Allows filtering, differential weighting, or source-specific validation downstream. ERA5 reanalysis uses its own schema with `grid_lat`/`grid_lon`.
 
 **Shared schema across sources (2026-03-02, updated 2026-03-10)**
-Synoptic observations use columns: `datetime`, `temp_c`, `humidity`, `wind_speed_kph`, `wind_dir_deg`, `precip_mm`, `stid`, `name`, `lat`, `lon`, `elev_m`, `network`, `source`. Open-Meteo dense grid uses: `datetime`, `temp_c`, `humidity`, `wind_speed_kph`, `wind_dir_deg`, `precip_mm`, `cloud_cover_pct`, `pressure_hpa`, `grid_lat`, `grid_lon`, `source`. Schemas overlap on core weather variables; grid data uses `grid_lat`/`grid_lon` instead of station identifiers.
+Both Synoptic and Open-Meteo surface grid use identical columns: `datetime`, `temp_c`, `humidity`, `wind_speed_kph`, `wind_dir_deg`, `precip_mm`, `stid`, `name`, `lat`, `lon`, `elev_m`, `network`, `source`. Open-Meteo grid points use synthetic station IDs (`OM_{lat}_{lon}`) and include DEM-derived elevation. All training code treats sources uniformly.
 
 **Elevation: meters throughout (2026-03-02)**
-Synoptic reports in feet, converted on ingest (`* 0.3048`). ERA5 and Open-Meteo grid points have no explicit elevation field — elevation effects are captured implicitly in the model output. All downstream code assumes `elev_m` is in meters where present.
+Synoptic reports in feet, converted on ingest (`* 0.3048`). Open-Meteo provides DEM-derived elevation in meters via the API response. ERA5 grid points have no explicit elevation field. All downstream code assumes `elev_m` is in meters where present.
 
 ---
 
@@ -176,7 +176,7 @@ Synoptic reports in feet, converted on ingest (`* 0.3048`). ERA5 and Open-Meteo 
 **Pattern: environment variables only (2026-03-02)**
 All secrets (API tokens, keys) are passed via environment variables. No secrets are hardcoded in any script. Current variables:
 - `SYNOPTIC_TOKEN` — Synoptic API token (not the API key; generate from customer.synopticdata.com)
-- `WU_API_KEY` — Weather Underground API key (deprecated — WU pipeline replaced by Open-Meteo dense grid)
+- ~~`WU_API_KEY`~~ — removed (WU pipeline replaced by Open-Meteo, which requires no key)
 - AWS credentials — managed via `~/.aws/credentials`, not env vars; handled automatically by boto3
 
 **`.gitignore` coverage (2026-03-02)**
@@ -207,7 +207,7 @@ Items are marked with acceptance criteria where the answer gates further ML work
   Options: Synoptic Enterprise, NOAA ISD supplement for ASOS only, or accept 1-year scope. Decision needed before designing the seasonal component of the ML model.
 
 - [ ] **Run Open-Meteo dense grid download**
-  Done when: all ~900 grid points × 13 months exist in `raw/openmeteo_dense/monthly/`.
+  Done when: all ~900 grid points × 13 months exist in `raw/open_meteo/monthly/`.
 
 - [ ] **Validate Open-Meteo dense grid against Synoptic ASOS**
   Done when: mean bias and RMSE of Open-Meteo grid points vs. co-located ASOS stations (KSFO, KOAK, KSJC) are computed and documented. Expect small bias since both use model/reanalysis data, but quantify it.

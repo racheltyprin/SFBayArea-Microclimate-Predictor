@@ -17,17 +17,16 @@ CURRENT DATA SOURCE COVERAGE — SYNOPTIC ONLY:
     This script currently processes station metadata from Synoptic only
     (s3://bay-area-microclimate/raw/synoptic/metadata/stations.parquet).
 
-    TODO (WU): When WU data is available, also load and process:
-        s3://bay-area-microclimate/raw/wunderground/metadata/stations.parquet
-    Then concatenate both station sets (deduplicating by lat/lon proximity if
-    any WU stations overlap with Synoptic positions), compute features for all,
+    TODO (Open-Meteo): When Open-Meteo dense grid data is available, also load:
+        s3://bay-area-microclimate/raw/open_meteo/metadata/grid_points.parquet
+    Then concatenate both station/grid-point sets, compute features for all,
     and save to the same output path. The feature computation functions below
     are source-agnostic and require no changes.
 
 S3 layout:
     Input:
         raw/synoptic/metadata/stations.parquet
-        [TODO: raw/wunderground/metadata/stations.parquet]
+        [TODO: raw/open_meteo/metadata/grid_points.parquet]
     Output:
         features/static/stations_with_features.parquet
 """
@@ -171,12 +170,12 @@ def main():
     synoptic_stations = load_parquet_from_s3(synoptic_key)
     log.info(f"  Synoptic: {len(synoptic_stations)} stations")
 
-    # TODO (WU): Uncomment and implement when WU data is available.
-    # wu_key = "raw/wunderground/metadata/stations.parquet"
-    # wu_stations = load_parquet_from_s3(wu_key)
-    # log.info(f"  WU: {len(wu_stations)} stations")
+    # TODO (Open-Meteo): Uncomment when Open-Meteo dense grid data is available.
+    # om_key = "raw/open_meteo/metadata/grid_points.parquet"
+    # om_stations = load_parquet_from_s3(om_key)
+    # log.info(f"  Open-Meteo: {len(om_stations)} grid points")
     #
-    # Combine both sources. WU stations outnumber Synoptic by ~10x in
+    # Combine both sources. Open-Meteo grid points provide dense spatial coverage in
     # residential areas, dramatically improving zone boundary resolution.
     # stations = pd.concat([synoptic_stations, wu_stations], ignore_index=True)
     # stations = stations.drop_duplicates(subset=["stid"])
