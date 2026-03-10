@@ -60,27 +60,29 @@ Synoptic timeseries API supports batching multiple stations in one call. 50 stat
 
 ---
 
-### Weather Underground (WU) [not implemented]
+### Open-Meteo Dense Grid [not yet run] (replaces Weather Underground)
 
-**Status (2026-03-02)**
-The WU pipeline (`src/download_wunderground.py`) is fully written and reviewed but has not been run. No WU API key exists yet. Access is contingent on registering a personal weather station (PWS) device with the WU network — the device has been purchased and is in transit. Until the device is registered and an API key is issued, none of the WU code has been validated against real API responses.
+**Pivot from WU to Open-Meteo (2026-03-10)**
+The Weather Underground pipeline (`src/download_wunderground.py`) was abandoned because WU's API access model is unreliable — it requires registering a physical PWS device, the API key issuance process is opaque, and the APIs have known issues. Open-Meteo's free archive API provides a cleaner replacement with several advantages:
+- No API key or device registration required
+- Consistent data quality (model-interpolated, not noisy backyard sensors)
+- 20+ years of history available (not limited like Synoptic free tier)
+- Deterministic grid coverage (no station discovery step, no gaps)
 
-All WU architectural decisions below should be treated as design intent, not verified behavior.
+**Status (2026-03-10)**
+`src/download_openmeteo_dense.py` is written and ready to run. Follows the same pattern as `download_era5.py` but at much higher spatial resolution. Has not been executed yet.
 
-**Access model: PWS contributor (2026-03-02)**
-WU API access requires registering a PWS with the WU network. The device uploads live observations; in return the API key grants access to the full historical PWS network. API key goes in `WU_API_KEY` env var.
+**Grid resolution: 0.05° (~5km) (2026-03-10)**
+Dense grid at 0.05° spacing gives ~900 grid points across the Bay Area bbox. This is 25x denser than the ERA5 grid (36 points at 0.25°) and provides fine-grained spatial variation needed for microclimate modeling. The underlying ERA5 reanalysis is 0.25° native, so Open-Meteo interpolates — but the interpolated values still capture local terrain effects through the model's orography.
 
-**Per-station-per-day API structure (2026-03-02)**
-WU history API (`/v2/pws/history/hourly`) returns one day per station per call — no bulk batching. With ~2,000 Bay Area stations × 365 days = ~730,000 calls/year. Mitigated with `ThreadPoolExecutor` (default 5 workers). Rate limits not yet known — tune `MAX_WORKERS` based on actual API responses (watch for HTTP 429).
+**Variables: surface-level observations (2026-03-10)**
+`temperature_2m`, `relative_humidity_2m`, `wind_speed_10m`, `wind_direction_10m`, `precipitation`, `cloud_cover`, `surface_pressure`. These complement ERA5's synoptic-scale variables (boundary layer height, 850hPa temperature) with local surface detail.
 
-**Station discovery via grid sampling (2026-03-02)**
-WU has no bbox query for historical data. `/v2/pws/nearby` is queried at a 0.15° grid (~15km spacing) across the Bay Area with 12km radius, then deduplicated. Approximately 100 grid queries to discover all stations. Overlap between grid cells intentional to avoid gaps at cell boundaries.
+**S3 layout: per-grid-point per month (2026-03-10)**
+`raw/openmeteo_dense/monthly/YYYY-MM/grid_{lat}_{lon}.parquet` — matches the ERA5 layout for consistency. Resumable via S3 key existence checks.
 
-**S3 layout: per-station-month (2026-03-02)**
-`raw/wunderground/monthly/YYYY-MM/{stid}.parquet` — one file per station per month. Matches the download granularity and enables efficient resumability. Different from Synoptic's chunk layout because WU cannot be batched.
-
-**WU data quality: not yet assessed (2026-03-02)**
-WU backyard stations vary significantly in quality. Known issues: poor siting (near AC exhaust, asphalt, under eaves), cheap sensors, calibration drift, missing elevation metadata. Quality validation plan: compare each WU station's mean temperature against the nearest Synoptic ASOS station adjusted for elevation lapse rate; flag stations with persistent bias > 2°C. Not yet implemented.
+**Tradeoff vs. real station observations (2026-03-10)**
+Open-Meteo dense grid data is model output, not direct observations. It will not capture hyper-local effects (street-level heat islands, building shadows, irrigation cooling) that real PWS data would. However, the consistent quality and coverage make it a better foundation for the model-first workflow — the model can learn spatial patterns from the dense grid, and Synoptic ASOS stations provide ground-truth calibration.
 
 ---
 
@@ -116,10 +118,28 @@ Station elevation comes from Synoptic's station metadata (reported by operators,
 
 ---
 
-## Zone Clustering Implemented, not yet run
+## Modeling & Zone Definition Strategy
 
-**Status (2026-03-02)**
-`src/cluster_zones.py` is written. Depends on both Synoptic observations and static features being in S3. Has not been run — no output to evaluate yet.
+**Revised approach: model-first, cluster-second (2026-03-10)**
+The original plan was to cluster stations into microclimate zones upfront and then train per-zone or zone-aware models. This has been replaced with a model-first workflow that lets the data define zones rather than imposing them a priori:
+
+1. **Train model with spatial features as inputs.** The model receives elevation, coastal distance, bay distance, slope aspect, terrain exposure, and other geographic features alongside weather observations. It learns how spatial features relate to weather outcomes directly, without needing predefined zones.
+
+2. **Extract learned representations.** After training, extract the model's internal embeddings or evaluate predicted weather behavior across a dense spatial grid. This produces a "weather profile" at every point — predicted fog frequency, temperature variance, diurnal patterns, etc.
+
+3. **Cluster on predicted profiles.** Apply clustering (K-means or other) to the model-derived weather profiles, not raw geography. Zones emerge from learned weather behavior, so areas with similar predicted microclimates group together naturally. For example, Sunset and Mission would separate because their predicted fog frequency and diurnal patterns differ, even though they're geographically close.
+
+**Why this supersedes pre-clustering (2026-03-10)**
+Pre-clustering on raw observations + static features has several weaknesses:
+- Requires choosing K before seeing model performance
+- Clusters are constrained by input feature engineering (e.g., the heuristic `coastal_exposure`)
+- Geographically close but climatologically different areas (Sunset vs. Mission) may not separate without carefully engineered features
+- Model-derived zones adapt automatically as more data sources (WU) are added — no need to manually re-run clustering
+
+**Status of existing `cluster_zones.py` (2026-03-10)**
+`src/cluster_zones.py` remains in the codebase and may still be useful for exploratory analysis or as a baseline comparison against model-derived zones. Its original design decisions are preserved below for reference.
+
+### Legacy: Pre-clustering Design (reference only)
 
 **Algorithm: K-means (2026-03-02)**
 K-means chosen for interpretability and speed. Alternatives considered:
@@ -140,14 +160,14 @@ Stations with < 500 observations excluded from clustering. 500 obs ≈ 3 weeks o
 
 ## Schema
 
-**`source` column (2026-03-02)**
-All observation parquets include `source` (`"synoptic"` or `"wunderground"`). Allows filtering, differential weighting, or source-specific validation downstream. WU observations may receive lower training weight until quality validation passes.
+**`source` column (2026-03-02, updated 2026-03-10)**
+All observation parquets include `source` (`"synoptic"` or `"openmeteo_dense"`). Allows filtering, differential weighting, or source-specific validation downstream.
 
-**Shared schema across sources (2026-03-02)**
-Both sources use identical columns: `datetime`, `temp_c`, `humidity`, `wind_speed_kph`, `wind_dir_deg`, `precip_mm`, `stid`, `name`, `lat`, `lon`, `elev_m`, `network`, `source`. All training code treats sources uniformly.
+**Shared schema across sources (2026-03-02, updated 2026-03-10)**
+Synoptic observations use columns: `datetime`, `temp_c`, `humidity`, `wind_speed_kph`, `wind_dir_deg`, `precip_mm`, `stid`, `name`, `lat`, `lon`, `elev_m`, `network`, `source`. Open-Meteo dense grid uses: `datetime`, `temp_c`, `humidity`, `wind_speed_kph`, `wind_dir_deg`, `precip_mm`, `cloud_cover_pct`, `pressure_hpa`, `grid_lat`, `grid_lon`, `source`. Schemas overlap on core weather variables; grid data uses `grid_lat`/`grid_lon` instead of station identifiers.
 
 **Elevation: meters throughout (2026-03-02)**
-Synoptic reports in feet, converted on ingest (`* 0.3048`). WU reports in meters with `units=m`. ERA5 grid points have no elevation field. All downstream code assumes `elev_m` is in meters.
+Synoptic reports in feet, converted on ingest (`* 0.3048`). ERA5 and Open-Meteo grid points have no explicit elevation field — elevation effects are captured implicitly in the model output. All downstream code assumes `elev_m` is in meters where present.
 
 ---
 
@@ -156,7 +176,7 @@ Synoptic reports in feet, converted on ingest (`* 0.3048`). WU reports in meters
 **Pattern: environment variables only (2026-03-02)**
 All secrets (API tokens, keys) are passed via environment variables. No secrets are hardcoded in any script. Current variables:
 - `SYNOPTIC_TOKEN` — Synoptic API token (not the API key; generate from customer.synopticdata.com)
-- `WU_API_KEY` — Weather Underground API key (not yet obtained)
+- `WU_API_KEY` — Weather Underground API key (deprecated — WU pipeline replaced by Open-Meteo dense grid)
 - AWS credentials — managed via `~/.aws/credentials`, not env vars; handled automatically by boto3
 
 **`.gitignore` coverage (2026-03-02)**
@@ -180,23 +200,29 @@ Items are marked with acceptance criteria where the answer gates further ML work
 - [ ] **Run ERA5 download**
   Done when: all 36 grid points × 13 months exist in `raw/era5/monthly/`.
 
-- [ ] **Run static features and zone clustering**
-  Done when: `features/zones/zone_assignments.parquet` exists and zone map (lat/lon colored by zone_id) is visually coherent with known Bay Area microclimate geography.
+- [ ] **Run static features computation**
+  Done when: `features/static/stations_with_features.parquet` exists with dist_coast, dist_bay, elev_m, coastal_exposure for all stations.
 
 - [ ] **Decide on 20-year data strategy**
   Options: Synoptic Enterprise, NOAA ISD supplement for ASOS only, or accept 1-year scope. Decision needed before designing the seasonal component of the ML model.
 
-- [ ] **Validate WU station quality against Synoptic**
-  Done when: a per-station bias score (WU vs. nearest ASOS adjusted for elevation) is computed and a threshold for exclusion is chosen and documented here.
+- [ ] **Run Open-Meteo dense grid download**
+  Done when: all ~900 grid points × 13 months exist in `raw/openmeteo_dense/monthly/`.
 
-- [ ] **Obtain WU API key and run WU discovery + download**
-  Blocked on: device delivery and PWS registration.
-
-- [ ] **Re-run zone clustering after WU integration**
-  Revisit K and cluster boundaries. Expected: K increases, coastal fog gradient zones sharpen.
+- [ ] **Validate Open-Meteo dense grid against Synoptic ASOS**
+  Done when: mean bias and RMSE of Open-Meteo grid points vs. co-located ASOS stations (KSFO, KOAK, KSJC) are computed and documented. Expect small bias since both use model/reanalysis data, but quantify it.
 
 - [ ] **Define train/val/test split strategy**
-  Options: temporal split (last 2 months = test), spatial split (hold out zones), zone-stratified random. Choice affects how well the model generalizes to unseen times vs. unseen locations. Decision needed before any model training.
+  Options: temporal split (last 2 months = test), spatial split (hold out stations), stratified random. Choice affects how well the model generalizes to unseen times vs. unseen locations. Decision needed before any model training.
 
-- [ ] **Replace heuristic coastal_exposure with learned feature**
-  Done when: linear regression of (temp anomaly vs. dist_coast, elev, dist_bay) has R² > 0.5 on held-out stations.
+- [ ] **Train spatial-feature model (model-first workflow step 1)**
+  Build model with spatial features (elevation, coastal distance, bay distance, terrain exposure, etc.) as inputs alongside weather observations. Done when: model achieves reasonable prediction skill on held-out stations.
+
+- [ ] **Extract learned representations and define zones (model-first workflow steps 2-3)**
+  Extract model embeddings or predicted weather profiles across a spatial grid. Cluster on predicted profiles to define microclimate zones. Done when: zone map is visually coherent and zones separate known microclimate boundaries (e.g., Sunset vs. Mission, coastal fog belt vs. inland heat).
+
+- [ ] **Compare model-derived zones against legacy K-means baseline**
+  Run `cluster_zones.py` as baseline. Compare zone maps qualitatively and quantitatively (e.g., silhouette score, within-zone temperature variance). Document which approach produces more coherent zones.
+
+- [ ] **Re-evaluate zone resolution after Open-Meteo dense integration**
+  With ~900 dense grid points providing continuous spatial coverage, zones should be sharper than with sparse station data alone. May increase K or adopt continuous spatial interpolation instead of discrete zones.

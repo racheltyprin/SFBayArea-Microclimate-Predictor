@@ -26,8 +26,11 @@ import logging
 from datetime import datetime, timedelta
 
 import datetime as dt
+from dotenv import load_dotenv
 import requests
 import pandas as pd
+
+load_dotenv()
 from dateutil.relativedelta import relativedelta
 
 # Allow running from project root or src/

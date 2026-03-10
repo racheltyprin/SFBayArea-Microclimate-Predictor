@@ -1,29 +1,26 @@
 """
-ERA5 reanalysis downloader via Open-Meteo Archive API (free, no key required).
-Fetches large-scale atmospheric variables at a grid of points covering the Bay Area
-and saves hourly timeseries to S3 as parquet.
+Open-Meteo dense grid downloader for Bay Area Microclimate project.
+Fetches high-resolution historical weather data at a dense grid of points
+across the Bay Area to provide fine-grained spatial coverage.
 
-These grid-point timeseries serve as the "synoptic state" input features for the
-microclimate ML model — the large-scale atmospheric context that drives local
-temperature differences between microclimate zones.
+This replaces the Weather Underground PWS pipeline. Advantages:
+    - No API key required (free, open access)
+    - Consistent data quality (model output, not noisy PWS sensors)
+    - 20+ years of history available (not limited like Synoptic free tier)
+    - No dependency on registering a physical weather station device
 
 Usage:
-    python src/download_era5.py
+    python src/download_openmeteo_dense.py
 
 Dependencies:
-    pip install requests pandas boto3 pyarrow
-
-DATA SOURCE COVERAGE NOTE:
-    ERA5 features are purely reanalysis (model output) and are source-agnostic —
-    they apply equally to Synoptic stations and Open-Meteo dense grid points
-    without modification.
+    pip install requests pandas boto3 pyarrow python-dotenv
 
 S3 layout:
     s3://bay-area-microclimate/
-        raw/era5/
-            metadata/grid_points.parquet   ← ERA5 grid points and their lat/lon
+        raw/openmeteo_dense/
+            metadata/grid_points.parquet   <- dense grid point coordinates
             monthly/YYYY-MM/
-                grid_{lat}_{lon}.parquet   ← hourly ERA5 for one grid point, one month
+                grid_{lat}_{lon}.parquet   <- hourly obs for one point, one month
 """
 
 import os
@@ -36,9 +33,9 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import requests
 import pandas as pd
+from dateutil.relativedelta import relativedelta
 
 load_dotenv()
-from dateutil.relativedelta import relativedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.utils import upload_df_to_s3, s3_key_exists
@@ -46,32 +43,29 @@ from src.utils import upload_df_to_s3, s3_key_exists
 # ── Config ────────────────────────────────────────────────────────────────────
 
 BASE_URL   = "https://archive-api.open-meteo.com/v1/archive"
-S3_PREFIX  = "raw/era5"
+S3_PREFIX  = "raw/openmeteo_dense"
 
-# How many years of ERA5 to fetch — should match your Synoptic/WU download range.
-# ERA5 goes back to 1940 and is free regardless of how far back you go.
+# How many years of history to fetch. Open-Meteo archive goes back to 1940.
 YEARS_BACK = float(os.environ.get("YEARS_BACK", 1))
 
 # Bay Area bounding box: lon_min, lat_min, lon_max, lat_max
 BBOX = (-123.0, 36.9, -121.5, 38.3)
 
-# ERA5 native resolution is ~0.25°. Sampling at 0.25° gives full coverage
-# with no gaps and matches the reanalysis grid exactly.
-GRID_STEP_DEG = 0.25
+# Dense grid at 0.05° (~5km) spacing — provides fine-grained spatial coverage.
+# For the Bay Area bbox this gives roughly 29 lat × 31 lon = ~900 grid points.
+# Much denser than ERA5's 0.25° grid (36 points) while still manageable API-wise.
+GRID_STEP_DEG = 0.05
 
-# Hourly ERA5 variables to fetch from Open-Meteo.
-# These are selected to capture the large-scale atmospheric drivers of Bay Area
-# microclimates: marine layer depth, temperature gradient, wind regime.
-ERA5_VARIABLES = [
-    "temperature_2m",           # large-scale surface temperature (°C)
-    "relative_humidity_2m",     # large-scale surface humidity (%)
-    "surface_pressure",         # sea-level-equivalent pressure (hPa)
-    "wind_speed_10m",           # large-scale surface wind speed (km/h)
-    "wind_direction_10m",       # large-scale wind direction (°)
-    "precipitation",            # hourly precip (mm)
-    "cloud_cover",              # total cloud cover (%)
-    "boundary_layer_height",    # PBL height — key driver of marine layer intrusion (m)
-    "temperature_850hPa",       # free-atmosphere temp, proxy for subsidence inversion (°C)
+# Surface-level variables matching the observation schema.
+# These complement ERA5's synoptic-scale variables with local surface detail.
+DENSE_VARIABLES = [
+    "temperature_2m",
+    "relative_humidity_2m",
+    "wind_speed_10m",
+    "wind_direction_10m",
+    "precipitation",
+    "cloud_cover",
+    "surface_pressure",
 ]
 
 SLEEP_BETWEEN_CALLS = 1  # seconds — Open-Meteo is free but be polite
@@ -83,16 +77,16 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)s  %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("download_era5.log"),
+        logging.FileHandler("download_openmeteo_dense.log"),
     ],
 )
 log = logging.getLogger(__name__)
 
 # ── Grid generation ───────────────────────────────────────────────────────────
 
-def build_grid() -> list[tuple[float, float]]:
+def build_dense_grid() -> list[tuple[float, float]]:
     """
-    Generate lat/lon grid points covering the Bay Area bbox at ERA5 resolution.
+    Generate lat/lon grid points covering the Bay Area bbox at dense resolution.
     Returns list of (lat, lon) tuples rounded to 2 decimal places.
     """
     lon_min, lat_min, lon_max, lat_max = BBOX
@@ -115,19 +109,19 @@ def lat_lon_key(lat: float, lon: float) -> str:
 
 # ── Open-Meteo API ────────────────────────────────────────────────────────────
 
-def fetch_era5_month(lat: float, lon: float,
-                     month_start: datetime, month_end: datetime) -> pd.DataFrame | None:
+def fetch_dense_month(lat: float, lon: float,
+                      month_start: datetime, month_end: datetime) -> pd.DataFrame | None:
     """
-    Fetch hourly ERA5 data for one grid point over one month via Open-Meteo.
+    Fetch hourly surface weather data for one grid point over one month.
     Returns a DataFrame or None if the request fails.
     """
     r = requests.get(BASE_URL, params={
-        "latitude":           lat,
-        "longitude":          lon,
-        "start_date":         month_start.strftime("%Y-%m-%d"),
-        "end_date":           (month_end - timedelta(days=1)).strftime("%Y-%m-%d"),
-        "hourly":             ",".join(ERA5_VARIABLES),
-        "timezone":           "UTC",
+        "latitude":    lat,
+        "longitude":   lon,
+        "start_date":  month_start.strftime("%Y-%m-%d"),
+        "end_date":    (month_end - timedelta(days=1)).strftime("%Y-%m-%d"),
+        "hourly":      ",".join(DENSE_VARIABLES),
+        "timezone":    "UTC",
     }, timeout=60)
 
     if r.status_code != 200:
@@ -141,18 +135,17 @@ def fetch_era5_month(lat: float, lon: float,
         return None
 
     df = pd.DataFrame({
-        "datetime":              pd.to_datetime(times, utc=True),
-        "temp_2m_c":             hourly.get("temperature_2m"),
-        "humidity_2m":           hourly.get("relative_humidity_2m"),
-        "pressure_hpa":          hourly.get("surface_pressure"),
-        "wind_speed_10m_kph":    hourly.get("wind_speed_10m"),
-        "wind_dir_10m_deg":      hourly.get("wind_direction_10m"),
-        "precip_mm":             hourly.get("precipitation"),
-        "cloud_cover_pct":       hourly.get("cloud_cover"),
-        "boundary_layer_height_m": hourly.get("boundary_layer_height"),
-        "temp_850hpa_c":         hourly.get("temperature_850hPa"),
-        "grid_lat":              lat,
-        "grid_lon":              lon,
+        "datetime":         pd.to_datetime(times, utc=True),
+        "temp_c":           hourly.get("temperature_2m"),
+        "humidity":         hourly.get("relative_humidity_2m"),
+        "wind_speed_kph":   hourly.get("wind_speed_10m"),
+        "wind_dir_deg":     hourly.get("wind_direction_10m"),
+        "precip_mm":        hourly.get("precipitation"),
+        "cloud_cover_pct":  hourly.get("cloud_cover"),
+        "pressure_hpa":     hourly.get("surface_pressure"),
+        "grid_lat":         lat,
+        "grid_lon":         lon,
+        "source":           "openmeteo_dense",
     })
     return df
 
@@ -170,10 +163,10 @@ def month_range(start: datetime, end: datetime):
 def main():
     end_date   = datetime.now(dt.timezone.utc).replace(tzinfo=None)
     start_date = end_date - timedelta(days=int(YEARS_BACK * 365))
-    log.info(f"ERA5 download range: {start_date.date()} → {end_date.date()}")
+    log.info(f"Open-Meteo dense download range: {start_date.date()} → {end_date.date()}")
 
-    grid = build_grid()
-    log.info(f"ERA5 grid: {len(grid)} points at {GRID_STEP_DEG}° spacing "
+    grid = build_dense_grid()
+    log.info(f"Dense grid: {len(grid)} points at {GRID_STEP_DEG}° spacing "
              f"({BBOX[0]}–{BBOX[2]} lon, {BBOX[1]}–{BBOX[3]} lat)")
 
     # Save grid point metadata to S3
@@ -181,8 +174,9 @@ def main():
     upload_df_to_s3(meta_df, f"{S3_PREFIX}/metadata/grid_points.parquet", log)
 
     months = list(month_range(start_date, end_date))
+    total_requests = len(months) * len(grid)
     log.info(f"Downloading {len(months)} months × {len(grid)} grid points "
-             f"= {len(months) * len(grid)} total requests")
+             f"= {total_requests:,} total requests")
 
     for month_start, month_end in months:
         month_str = month_start.strftime("%Y-%m")
@@ -197,7 +191,7 @@ def main():
                 skipped += 1
                 continue
 
-            df = fetch_era5_month(lat, lon, month_start, month_end)
+            df = fetch_dense_month(lat, lon, month_start, month_end)
             if df is not None and len(df) > 0:
                 upload_df_to_s3(df, s3_key, log)
                 success += 1
@@ -210,7 +204,8 @@ def main():
         log.info(f"  Month {month_str}: {success} uploaded, "
                  f"{skipped} skipped, {failed} failed")
 
-    log.info("\nERA5 download complete. s3://bay-area-microclimate/raw/era5/")
+    log.info(f"\nOpen-Meteo dense download complete. "
+             f"s3://bay-area-microclimate/{S3_PREFIX}/")
 
 
 if __name__ == "__main__":
