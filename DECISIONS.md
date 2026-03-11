@@ -25,18 +25,15 @@ The Synoptic download pipeline is verified end-to-end. In the first confirmed ru
 
 Full 1-year download (13 months × 23 chunks = 299 API calls) still needs to be run to completion. The pipeline is correct but the S3 dataset is partial.
 
-**20-year baseline: blocked by free tier (2026-03-02)**
-The original project goal was 20 years of data to span multiple ENSO cycles and capture interannual variability. This is not achievable on the Synoptic Open Access free tier, which caps historical access at 1 year regardless of station.
+**Multi-year ENSO coverage strategy (2026-03-10)**
+Synoptic free tier is capped at 1 year, but Open-Meteo and ERA5 have no limit. The decided approach:
+- **Open-Meteo dense grid + ERA5:** download 10 years (2016–2026) to capture multiple ENSO phases:
+  - El Niño: 2023–2024 (strong), 2018–2019 (weak)
+  - La Niña: 2020–2022 (triple-dip), 2025–2026 (current)
+  - Neutral: 2019–2020, 2024–2025
+- **Synoptic:** 1 year only (free tier cap). Serves as ground-truth calibration for the most recent year, not the primary training signal for seasonal/interannual patterns.
 
-This is a hard constraint on the project scope, not a TODO:
-- Seasonal models trained on 1 year of data cannot generalize across ENSO phases
-- Winter 2025–2026 La Niña conditions will be overrepresented in the training set
-- Models will likely underperform during anomalous years (strong El Niño, drought)
-
-Options to resolve:
-1. Synoptic Enterprise plan (cost unknown, contact sales)
-2. Supplement with NOAA ISD free archive for ASOS stations only (KSFO etc. back to 1973)
-3. Treat 1-year scope as MVP and revisit after project is otherwise complete
+This resolves the original "blocked by free tier" concern without requiring Synoptic Enterprise or NOAA ISD supplements.
 
 **Token vs. API Key (2026-03-02)**
 Synoptic issues two separate credentials: an API Key and a Token generated from that key. The Token is what gets passed as `?token=` in all API requests. Using the API Key directly returns HTTP 401. All scripts use `SYNOPTIC_TOKEN` env var which must be a generated token, not the key itself.
@@ -86,75 +83,92 @@ Open-Meteo dense grid data is model output, not direct observations. It will not
 
 ---
 
-### ERA5 (Open-Meteo) Implemented, not yet run
+### ERA5 (Open-Meteo) [verified]
 
-**Status (2026-03-02)**
-`src/download_era5.py` is written and ready to run. Has not been executed yet — ERA5 download should be kicked off in parallel with or immediately after the Synoptic full run. No API key required.
+**Status (2026-03-10)**
+Complete: 546 files (42 grid points × 13 months) in S3. Download verified end-to-end.
 
 **Source: Open-Meteo Archive API (2026-03-02)**
-Free, no API key required. Provides ERA5 reanalysis back to 1940 at 0.25° resolution. Unlike Synoptic, ERA5 has no historical depth limit on the free tier — can download 20 years freely. This partially offsets the Synoptic 1-year constraint: ERA5 large-scale features will cover the full historical range even if station observations are limited to 1 year.
+Free, no API key required. Provides ERA5 reanalysis back to 1940 at 0.25° resolution. No historical depth limit — will download 10 years to match Open-Meteo dense grid for ENSO coverage.
 
 **Grid resolution: 0.25° (2026-03-02)**
-Matches ERA5 native resolution (~27km). For the Bay Area domain this gives a 6×6=36 point grid. ERA5 is intentionally coarse — it provides synoptic context, not microclimate. Microclimate signal comes from the station observations.
+Matches ERA5 native resolution (~27km). For the Bay Area domain this gives 42 grid points. ERA5 is intentionally coarse — it provides synoptic-scale atmospheric context, not microclimate detail.
 
-**Variables selected (2026-03-02)**
-`boundary_layer_height` is included because marine layer intrusion depth is the primary driver of coastal vs. inland temperature differences. `temperature_850hPa` captures the free-atmosphere temperature that determines subsidence inversion strength. Both are non-standard and not included in basic weather APIs.
+**ERA5 as a primary model input, not just background context (2026-03-10)**
+`boundary_layer_height` is the depth of the marine layer — directly controlling fog penetration and the Sunset/Mission dynamic. Very few microclimate studies use this as an input feature. Combined with `temp_850hPa` (the temperature aloft that drives the subsidence inversion), ERA5 provides physical variables that encode *why* fog behaves differently across neighborhoods, not just surface conditions. This upgrades ERA5 from "coarse background feature" to a genuinely important model input despite its resolution limitation.
 
----
-
-## Static Features Implemented, not yet run
-
-**Status (2026-03-02)**
-`src/compute_static_features.py` is written. Depends on Synoptic metadata parquet being in S3 (already uploaded). Can be run as soon as the Synoptic download produces `raw/synoptic/metadata/stations.parquet`.
-
-**Coast distance: waypoint approximation (2026-03-02)**
-Pacific coast and SF Bay distances are computed as minimum great-circle distance to a manually defined set of waypoints, not a full coastline polygon. Accuracy is sufficient for ~10km zone boundaries but will introduce errors for stations in complex coastal geometry (Sausalito, Tiburon). A proper coastline shapefile would improve accuracy at the cost of a `shapely`/`geopandas` dependency.
-
-**Elevation source: Synoptic metadata (2026-03-02)**
-Station elevation comes from Synoptic's station metadata (reported by operators, in feet, converted to meters). Known to be inaccurate for some stations. SRTM 30m DEM would provide ground truth. Not yet implemented — especially important for WU stations where elevation is often missing entirely.
-
-**Coastal exposure: heuristic composite (2026-03-02)**
-`coastal_exposure = 1 - dist_coast_normalized - elev_normalized * 0.3` is a hand-crafted formula, not learned from data. Will be replaced by an empirical feature once there is enough observation data to regress station temperature anomaly against candidate features.
+**ERA5 interpolation to station/grid locations (2026-03-10)**
+ERA5 values must be spatially interpolated to each Synoptic station location and each Open-Meteo dense grid point. The 42-point ERA5 grid is too coarse to use directly — bilinear interpolation at each station lat/lon will produce per-station-timestep ERA5 features. This is a preprocessing step, not a new download.
 
 ---
 
-## Modeling & Zone Definition Strategy
+## Static / Terrain Features
 
-**Revised approach: model-first, cluster-second (2026-03-10)**
-The original plan was to cluster stations into microclimate zones upfront and then train per-zone or zone-aware models. This has been replaced with a model-first workflow that lets the data define zones rather than imposing them a priori:
+**Current status (2026-03-10)**
+`src/compute_static_features.py` computes coastal distance and bay distance from waypoints. Already run — output in S3. However, the Stage 1 GBT model needs additional terrain features not yet collected.
 
-1. **Train model with spatial features as inputs.** The model receives elevation, coastal distance, bay distance, slope aspect, terrain exposure, and other geographic features alongside weather observations. It learns how spatial features relate to weather outcomes directly, without needing predefined zones.
+**What exists:**
+- `dist_coast_km` — great-circle distance to Pacific coast waypoints (sufficient for ~10km zones, imprecise at Sausalito/Tiburon)
+- `dist_bay_km` — distance to SF Bay shoreline waypoints
+- `elev_m` — from Synoptic metadata (feet→meters). Known inaccuracies for some stations.
+- `coastal_exposure` — heuristic composite, will be replaced by model-learned feature
 
-2. **Extract learned representations.** After training, extract the model's internal embeddings or evaluate predicted weather behavior across a dense spatial grid. This produces a "weather profile" at every point — predicted fog frequency, temperature variance, diurnal patterns, etc.
+**What's needed for Stage 1 GBT (not yet collected):**
+- **DEM-derived terrain features** — elevation, slope, aspect at each station and grid point. Source: SRTM 30m or USGS 3DEP (both free). Critical for cold-air pooling and shadow effects. Current Synoptic elevation metadata is operator-reported and unreliable.
+- **Land cover type** — urban/vegetation/water classification at each station. Source: NLCD (National Land Cover Database, free). Needed to distinguish built environment thermal effects from natural terrain.
+- Both must be computed at Synoptic station locations (Stage 1) and at all 899 Open-Meteo grid points (Stage 3).
 
-3. **Cluster on predicted profiles.** Apply clustering (K-means or other) to the model-derived weather profiles, not raw geography. Zones emerge from learned weather behavior, so areas with similar predicted microclimates group together naturally. For example, Sunset and Mission would separate because their predicted fog frequency and diurnal patterns differ, even though they're geographically close.
+---
 
-**Why this supersedes pre-clustering (2026-03-10)**
-Pre-clustering on raw observations + static features has several weaknesses:
-- Requires choosing K before seeing model performance
-- Clusters are constrained by input feature engineering (e.g., the heuristic `coastal_exposure`)
-- Geographically close but climatologically different areas (Sunset vs. Mission) may not separate without carefully engineered features
-- Model-derived zones adapt automatically as more data sources (WU) are added — no need to manually re-run clustering
+## Modeling Strategy
 
-**Status of existing `cluster_zones.py` (2026-03-10)**
-`src/cluster_zones.py` remains in the codebase and may still be useful for exploratory analysis or as a baseline comparison against model-derived zones. Its original design decisions are preserved below for reference.
+### Architecture decision: GBT-first, not Geo-LSTM-Kriging (2026-03-10)
 
-### Legacy: Pre-clustering Design (reference only)
+**Decision:** Lead with gradient-boosted trees (XGBoost/LightGBM), not the Geo-LSTM-Kriging architecture from Han et al.
 
-**Algorithm: K-means (2026-03-02)**
-K-means chosen for interpretability and speed. Alternatives considered:
-- Hierarchical clustering: better for discovering K, doesn't scale to 10k+ WU stations
-- DBSCAN: no predefined K, but every station must belong to a zone — noise points problematic
-- GMM: soft assignments useful for fog-belt edge stations, adds complexity — revisit post-WU
+**Rationale — literature failures at mesoscale:**
+- Han et al.'s Warsaw results: Kriging achieved RMSE 3.0°C and R² 0.58 at mesoscale. These numbers are a concrete failure case for Bay Area microclimate prediction where we need sub-degree accuracy to differentiate neighborhoods.
+- The vertical dimension is absent from Geo-LSTM-Kriging. SF fog is fundamentally a vertical phenomenon — marine layer height, subsidence inversion — that none of these architectures handle natively.
+- At neighborhood scale with uneven station density, the Kriging interpolation layer is more likely to hurt than help.
 
-**Feature matrix: diurnal cycle + static features (2026-03-02)**
-The 24-dimensional diurnal temperature cycle is the dominant clustering signal — coastal stations peak late with small amplitude, inland stations peak earlier with large amplitude. Static features add geographic regularization so clusters are spatially coherent.
+**Predict variables separately (2026-03-10)**
+One model per target variable (temperature, humidity, wind speed, wind direction, precipitation). Each has different dominant drivers — fog is primarily coastal distance + season, temperature is terrain + land cover, humidity is both. Separate models reveal what's driving each variable. Multi-output architectures are a later optimization, not a starting point.
 
-**K=7 default (2026-03-02)**
-Based on qualitative description of Bay Area microclimates. Not yet validated against data. Run `elbow_plot()` in `cluster_zones.py` before committing to K=7.
+### Stage 1: GBT per variable [not implemented]
 
-**Minimum observations filter: 500 (2026-03-02)**
-Stations with < 500 observations excluded from clustering. 500 obs ≈ 3 weeks of hourly data. Somewhat arbitrary — increase to 1,000 if noisy sparse stations are visibly distorting clusters.
+One XGBoost or LightGBM model per target variable. Each model takes a flat feature vector per station-timestep:
+
+**Observation features:**
+- Synoptic lag values for that station (t-1hr, t-3hr, t-6hr)
+- Neighboring station values (distance-weighted mean of nearest N stations)
+
+**ERA5 features interpolated to station location:**
+- `boundary_layer_height` — most important feature for fog dynamics
+- `temp_850hPa` — captures inversion strength
+- `cloud_cover`, `pressure`, wind components
+
+**Static terrain features per station:**
+- Elevation, coastal distance, slope aspect (from DEM)
+- Land cover type — urban/vegetation/water (from NLCD)
+
+This stage tells us which features matter per variable and gives a strong baseline RMSE.
+
+### Stage 2: LSTM for temperature and humidity [not implemented]
+
+Once Stage 1 is working, wrap an LSTM around temperature and humidity specifically. These two have strong diurnal cycles and sequential memory — yesterday's afternoon temperature predicts tonight's low more reliably than spatial features alone. Wind and precipitation are more event-driven and probably don't benefit as much from temporal modeling.
+
+- Input sequence: 24-hour rolling window of observations + ERA5 features per station
+- Terrain features concatenated as static context at each timestep (not part of the sequence)
+- Minimum ~6 months of clean per-station history needed. We have 13 months.
+- Requires restructuring chunked Synoptic data into per-station continuous time series with gap handling.
+
+### Stage 3: Spatial interpolation to Open-Meteo dense grid [not implemented]
+
+Use trained Stage 1/2 model to predict at each of the 899 Open-Meteo grid points using ERA5 + terrain features as inputs (no Synoptic observations needed at grid points — the model has learned to predict from spatial/atmospheric features alone). This produces a continuous weather map across the Bay Area.
+
+This is the microclimate parcellation step — the predicted patterns across the dense grid are what we cluster to define zones. Zones emerge from learned weather behavior, not raw geography. Sunset and Mission naturally separate because their predicted fog frequency and diurnal patterns differ.
+
+Supersedes the original pre-clustering approach (`src/cluster_zones.py`, retained for baseline comparison).
 
 ---
 
@@ -192,37 +206,47 @@ Both the Synoptic API key and a subsequently generated token were exposed in HTT
 
 ## Open Questions and To Do
 
-Items are marked with acceptance criteria where the answer gates further ML work.
+### Decided
 
-- [ ] **Complete Synoptic 1-year download**
-  Done when: all 13 months × 23 chunks exist in S3 with no "No data" chunks for KSFO/KOAK rows.
+- [x] **Multi-year data strategy** — 10 years of Open-Meteo + ERA5 for ENSO coverage; Synoptic 1-year for ground-truth calibration.
+- [x] **ML architecture** — 3-stage pipeline: GBT per variable → LSTM for temp/humidity → spatial interpolation to dense grid. Not Geo-LSTM-Kriging.
+- [x] **ERA5 role** — Upgraded from background context to primary model input. `boundary_layer_height` and `temp_850hPa` are key fog dynamics features.
 
-- [ ] **Run ERA5 download**
-  Done when: all 36 grid points × 13 months exist in `raw/era5/monthly/`.
+### Next steps: fill data gaps for Stage 1 GBT
 
-- [ ] **Run static features computation**
-  Done when: `features/static/stations_with_features.parquet` exists with dist_coast, dist_bay, elev_m, coastal_exposure for all stations.
+| Data | Stage | Status |
+|------|-------|--------|
+| Complete Synoptic chunks 18–22 (5/month × 13 months) | 1 | Missing — run `download_synoptic.py` to completion |
+| ERA5 → Synoptic station interpolation | 1 | Derive from existing ERA5 grid (bilinear interp to each station lat/lon) |
+| DEM terrain features at stations (elevation, slope, aspect) | 1 | Not collected — pull from SRTM 30m or USGS 3DEP |
+| NLCD land cover at stations (urban/vegetation/water) | 1 | Not collected — pull from NLCD |
+| Synoptic lag features (t-1hr, t-3hr, t-6hr) | 1 | Derive during preprocessing |
+| Neighboring station features (distance-weighted mean) | 1 | Derive during preprocessing |
 
-- [ ] **Decide on 20-year data strategy**
-  Options: Synoptic Enterprise, NOAA ISD supplement for ASOS only, or accept 1-year scope. Decision needed before designing the seasonal component of the ML model.
+### Later stages
 
-- [ ] **Run Open-Meteo dense grid download**
-  Done when: all ~900 grid points × 13 months exist in `raw/open_meteo/monthly/`.
+| Data | Stage | Status |
+|------|-------|--------|
+| Per-station continuous time series with gap handling | 2 | Derive from chunked Synoptic data |
+| Open-Meteo dense grid (899 pts × 10 years) | 3 | Not run — `YEARS_BACK=10`, ~16 hrs |
+| ERA5 interpolated to 899 grid points | 3 | Derive from existing ERA5 grid |
+| DEM + NLCD at 899 grid points | 3 | Not collected — same sources as Stage 1 |
 
-- [ ] **Validate Open-Meteo dense grid against Synoptic ASOS**
-  Done when: mean bias and RMSE of Open-Meteo grid points vs. co-located ASOS stations (KSFO, KOAK, KSJC) are computed and documented. Expect small bias since both use model/reanalysis data, but quantify it.
+### Modeling decisions (after data gaps filled)
 
-- [ ] **Define train/val/test split strategy**
-  Options: temporal split (last 2 months = test), spatial split (hold out stations), stratified random. Choice affects how well the model generalizes to unseen times vs. unseen locations. Decision needed before any model training.
+- [ ] **Define train/val/test split strategy** — temporal, spatial, or stratified
+- [ ] **Train Stage 1 GBT** — separate models per variable, evaluate feature importance
+- [ ] **Validate Open-Meteo vs. Synoptic ASOS** — bias/RMSE at co-located points (KSFO, KOAK, KSJC)
+- [ ] **Stage 2: LSTM for temp/humidity** — 24hr rolling window, static terrain context
+- [ ] **Stage 3: predict at dense grid, cluster into zones** — microclimate parcellation
 
-- [ ] **Train spatial-feature model (model-first workflow step 1)**
-  Build model with spatial features (elevation, coastal distance, bay distance, terrain exposure, etc.) as inputs alongside weather observations. Done when: model achieves reasonable prediction skill on held-out stations.
+---
 
-- [ ] **Extract learned representations and define zones (model-first workflow steps 2-3)**
-  Extract model embeddings or predicted weather profiles across a spatial grid. Cluster on predicted profiles to define microclimate zones. Done when: zone map is visually coherent and zones separate known microclimate boundaries (e.g., Sunset vs. Mission, coastal fog belt vs. inland heat).
+## References
 
-- [ ] **Compare model-derived zones against legacy K-means baseline**
-  Run `cluster_zones.py` as baseline. Compare zone maps qualitatively and quantitatively (e.g., silhouette score, within-zone temperature variance). Document which approach produces more coherent zones.
-
-- [ ] **Re-evaluate zone resolution after Open-Meteo dense integration**
-  With ~900 dense grid points providing continuous spatial coverage, zones should be sharper than with sparse station data alone. May increase K or adopt continuous spatial interpolation instead of discrete zones.
+- Han, S. et al. — "Geo-LSTM-Kriging: A spatiotemporal deep learning approach for temperature interpolation." Warsaw mesoscale evaluation: Kriging RMSE 3.0C, R2 0.58. Informed the decision to reject Kriging at neighborhood scale and the absence of vertical atmospheric structure (marine layer height, inversion) as a gap for Bay Area fog modeling.
+- Open-Meteo Archive API — https://open-meteo.com/en/docs/historical-weather-api. Source for ERA5 reanalysis and dense surface grid data. Free, no API key required.
+- Synoptic Data API — https://docs.synopticdata.com/services/time-series. Source for ground-truth station observations. Free Open Access tier capped at 1 year of history.
+- ERA5 reanalysis (Hersbach et al., 2020) — ECMWF's fifth-generation global atmospheric reanalysis, 0.25 degree resolution. Accessed via Open-Meteo. Key variables: `boundary_layer_height`, `temperature_850hPa`.
+- SRTM 30m DEM — https://earthexplorer.usgs.gov/. Planned source for elevation, slope, aspect terrain features.
+- NLCD (National Land Cover Database) — https://www.mrlc.gov/. Planned source for land cover classification (urban/vegetation/water).
