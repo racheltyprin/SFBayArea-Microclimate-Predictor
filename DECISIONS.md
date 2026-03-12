@@ -26,12 +26,12 @@ The Synoptic download pipeline is verified end-to-end. In the first confirmed ru
 Full 1-year download (13 months × 23 chunks = 299 API calls) still needs to be run to completion. The pipeline is correct but the S3 dataset is partial.
 
 **Multi-year ENSO coverage strategy (2026-03-10)**
-Synoptic free tier is capped at 1 year, but Open-Meteo and ERA5 have no limit. The decided approach:
-- **Open-Meteo dense grid + ERA5:** download 10 years (2016–2026) to capture multiple ENSO phases:
+Synoptic free tier is capped at 1 year, but ERA5 has no limit. The decided approach:
+- **ERA5:** download 10 years (2016–2026) to capture multiple ENSO phases:
   - El Niño: 2023–2024 (strong), 2018–2019 (weak)
   - La Niña: 2020–2022 (triple-dip), 2025–2026 (current)
   - Neutral: 2019–2020, 2024–2025
-- **Synoptic:** 1 year only (free tier cap). Serves as ground-truth calibration for the most recent year, not the primary training signal for seasonal/interannual patterns.
+- **Synoptic:** 1 year only (free tier cap). Primary training data from real observations.
 
 This resolves the original "blocked by free tier" concern without requiring Synoptic Enterprise or NOAA ISD supplements.
 
@@ -57,29 +57,13 @@ Synoptic timeseries API supports batching multiple stations in one call. 50 stat
 
 ---
 
-### Open-Meteo Dense Grid [not yet run] (replaces Weather Underground)
+### Removed data sources
 
-**Pivot from WU to Open-Meteo (2026-03-10)**
-The Weather Underground pipeline (`src/download_wunderground.py`) was abandoned because WU's API access model is unreliable — it requires registering a physical PWS device, the API key issuance process is opaque, and the APIs have known issues. Open-Meteo's free archive API provides a cleaner replacement with several advantages:
-- No API key or device registration required
-- Consistent data quality (model-interpolated, not noisy backyard sensors)
-- 20+ years of history available (not limited like Synoptic free tier)
-- Deterministic grid coverage (no station discovery step, no gaps)
+**Weather Underground (removed 2026-03-10)**
+Abandoned because WU's API access model is unreliable — requires registering a physical PWS device, the API key issuance process is opaque, and the APIs have known issues.
 
-**Status (2026-03-10)**
-`src/download_open_meteo.py` is written and ready to run. Follows the same pattern as `download_era5.py` but at much higher spatial resolution. Has not been executed yet.
-
-**Grid resolution: 0.05° (~5km) (2026-03-10)**
-Dense grid at 0.05° spacing gives ~900 grid points across the Bay Area bbox. This is 25x denser than the ERA5 grid (36 points at 0.25°) and provides fine-grained spatial variation needed for microclimate modeling. The underlying ERA5 reanalysis is 0.25° native, so Open-Meteo interpolates — but the interpolated values still capture local terrain effects through the model's orography.
-
-**Variables: surface-level observations (2026-03-10)**
-`temperature_2m`, `relative_humidity_2m`, `wind_speed_10m`, `wind_direction_10m`, `precipitation`, `cloud_cover`, `surface_pressure`. These complement ERA5's synoptic-scale variables (boundary layer height, 850hPa temperature) with local surface detail.
-
-**S3 layout: per-grid-point per month (2026-03-10)**
-`raw/open_meteo/monthly/YYYY-MM/grid_{lat}_{lon}.parquet` — matches the ERA5 layout for consistency. Resumable via S3 key existence checks.
-
-**Tradeoff vs. real station observations (2026-03-10)**
-Open-Meteo dense grid data is model output, not direct observations. It will not capture hyper-local effects (street-level heat islands, building shadows, irrigation cooling) that real PWS data would. However, the consistent quality and coverage make it a better foundation for the model-first workflow — the model can learn spatial patterns from the dense grid, and Synoptic ASOS stations provide ground-truth calibration.
+**Open-Meteo Dense Grid (removed 2026-03-10)**
+Originally planned as a replacement for Weather Underground, providing ~899 grid points at 0.05° spacing across the Bay Area. Removed because Open-Meteo surface data is model-interpolated reanalysis output, not real observations. Training on it would teach the model to replicate another model's interpolation assumptions rather than learning from reality. Synoptic's ~600+ professional stations already provide sufficient spatial coverage with real observations, and terrain features (DEM, NLCD) encode the neighborhood-level physics that a dense grid was meant to capture. The `src/download_open_meteo.py` and `src/download_openmeteo_dense.py` scripts are retained but unused.
 
 ---
 
@@ -89,7 +73,7 @@ Open-Meteo dense grid data is model output, not direct observations. It will not
 Complete: 546 files (42 grid points × 13 months) in S3. Download verified end-to-end.
 
 **Source: Open-Meteo Archive API (2026-03-02)**
-Free, no API key required. Provides ERA5 reanalysis back to 1940 at 0.25° resolution. No historical depth limit — will download 10 years to match Open-Meteo dense grid for ENSO coverage.
+Free, no API key required. Provides ERA5 reanalysis back to 1940 at 0.25° resolution. No historical depth limit — downloading 10 years (2016–2026) for ENSO coverage.
 
 **Grid resolution: 0.25° (2026-03-02)**
 Matches ERA5 native resolution (~27km). For the Bay Area domain this gives 42 grid points. ERA5 is intentionally coarse — it provides synoptic-scale atmospheric context, not microclimate detail.
@@ -98,7 +82,7 @@ Matches ERA5 native resolution (~27km). For the Bay Area domain this gives 42 gr
 `boundary_layer_height` is the depth of the marine layer — directly controlling fog penetration and the Sunset/Mission dynamic. Very few microclimate studies use this as an input feature. Combined with `temp_850hPa` (the temperature aloft that drives the subsidence inversion), ERA5 provides physical variables that encode *why* fog behaves differently across neighborhoods, not just surface conditions. This upgrades ERA5 from "coarse background feature" to a genuinely important model input despite its resolution limitation.
 
 **ERA5 interpolation to station/grid locations (2026-03-10)**
-ERA5 values must be spatially interpolated to each Synoptic station location and each Open-Meteo dense grid point. The 42-point ERA5 grid is too coarse to use directly — bilinear interpolation at each station lat/lon will produce per-station-timestep ERA5 features. This is a preprocessing step, not a new download.
+ERA5 values must be spatially interpolated to each Synoptic station location (and later to arbitrary prediction grid points for Stage 3). The 42-point ERA5 grid is too coarse to use directly — bilinear interpolation at each target lat/lon will produce per-location-timestep ERA5 features. This is a preprocessing step, not a new download.
 
 ---
 
@@ -116,7 +100,7 @@ ERA5 values must be spatially interpolated to each Synoptic station location and
 **What's needed for Stage 1 GBT (not yet collected):**
 - **DEM-derived terrain features** — elevation, slope, aspect at each station and grid point. Source: SRTM 30m or USGS 3DEP (both free). Critical for cold-air pooling and shadow effects. Current Synoptic elevation metadata is operator-reported and unreliable.
 - **Land cover type** — urban/vegetation/water classification at each station. Source: NLCD (National Land Cover Database, free). Needed to distinguish built environment thermal effects from natural terrain.
-- Both must be computed at Synoptic station locations (Stage 1) and at all 899 Open-Meteo grid points (Stage 3).
+- Both must be computed at Synoptic station locations (Stage 1) and at prediction grid points (Stage 3).
 
 ---
 
@@ -162,11 +146,11 @@ Once Stage 1 is working, wrap an LSTM around temperature and humidity specifical
 - Minimum ~6 months of clean per-station history needed. We have 13 months.
 - Requires restructuring chunked Synoptic data into per-station continuous time series with gap handling.
 
-### Stage 3: Spatial interpolation to Open-Meteo dense grid [not implemented]
+### Stage 3: Spatial interpolation to prediction grid [not implemented]
 
-Use trained Stage 1/2 model to predict at each of the 899 Open-Meteo grid points using ERA5 + terrain features as inputs (no Synoptic observations needed at grid points — the model has learned to predict from spatial/atmospheric features alone). This produces a continuous weather map across the Bay Area.
+Use trained Stage 1/2 model to predict at arbitrary lat/lon points across the Bay Area using only ERA5 + terrain features as inputs (no Synoptic observations needed — the model has learned to predict from spatial/atmospheric features alone). The prediction grid is defined by us (e.g., a regular lat/lon mesh at whatever resolution we choose), not tied to any external data source. This produces a continuous weather map across the Bay Area.
 
-This is the microclimate parcellation step — the predicted patterns across the dense grid are what we cluster to define zones. Zones emerge from learned weather behavior, not raw geography. Sunset and Mission naturally separate because their predicted fog frequency and diurnal patterns differ.
+This is the microclimate parcellation step — the predicted patterns across the grid are what we cluster to define zones. Zones emerge from learned weather behavior, not raw geography. Sunset and Mission naturally separate because their predicted fog frequency and diurnal patterns differ.
 
 Supersedes the original pre-clustering approach (`src/cluster_zones.py`, retained for baseline comparison).
 
@@ -174,14 +158,11 @@ Supersedes the original pre-clustering approach (`src/cluster_zones.py`, retaine
 
 ## Schema
 
-**`source` column (2026-03-02, updated 2026-03-10)**
-All observation parquets include `source` (`"synoptic"` or `"open_meteo"`). Allows filtering, differential weighting, or source-specific validation downstream. ERA5 reanalysis uses its own schema with `grid_lat`/`grid_lon`.
-
-**Shared schema across sources (2026-03-02, updated 2026-03-10)**
-Both Synoptic and Open-Meteo surface grid use identical columns: `datetime`, `temp_c`, `humidity`, `wind_speed_kph`, `wind_dir_deg`, `precip_mm`, `stid`, `name`, `lat`, `lon`, `elev_m`, `network`, `source`. Open-Meteo grid points use synthetic station IDs (`OM_{lat}_{lon}`) and include DEM-derived elevation. All training code treats sources uniformly.
+**Synoptic observation schema (2026-03-02)**
+All Synoptic observation parquets use columns: `datetime`, `temp_c`, `humidity`, `wind_speed_kph`, `wind_dir_deg`, `precip_mm`, `stid`, `name`, `lat`, `lon`, `elev_m`, `network`, `source`. ERA5 reanalysis uses its own schema with `grid_lat`/`grid_lon`.
 
 **Elevation: meters throughout (2026-03-02)**
-Synoptic reports in feet, converted on ingest (`* 0.3048`). Open-Meteo provides DEM-derived elevation in meters via the API response. ERA5 grid points have no explicit elevation field. All downstream code assumes `elev_m` is in meters where present.
+Synoptic reports in feet, converted on ingest (`* 0.3048`). ERA5 grid points have no explicit elevation field. All downstream code assumes `elev_m` is in meters where present.
 
 ---
 
@@ -190,7 +171,7 @@ Synoptic reports in feet, converted on ingest (`* 0.3048`). Open-Meteo provides 
 **Pattern: environment variables only (2026-03-02)**
 All secrets (API tokens, keys) are passed via environment variables. No secrets are hardcoded in any script. Current variables:
 - `SYNOPTIC_TOKEN` — Synoptic API token (not the API key; generate from customer.synopticdata.com)
-- ~~`WU_API_KEY`~~ — removed (WU pipeline replaced by Open-Meteo, which requires no key)
+- ~~`WU_API_KEY`~~ — removed (WU pipeline abandoned; see "Removed data sources")
 - AWS credentials — managed via `~/.aws/credentials`, not env vars; handled automatically by boto3
 
 **`.gitignore` coverage (2026-03-02)**
@@ -208,9 +189,10 @@ Both the Synoptic API key and a subsequently generated token were exposed in HTT
 
 ### Decided
 
-- [x] **Multi-year data strategy** — 10 years of Open-Meteo + ERA5 for ENSO coverage; Synoptic 1-year for ground-truth calibration.
-- [x] **ML architecture** — 3-stage pipeline: GBT per variable → LSTM for temp/humidity → spatial interpolation to dense grid. Not Geo-LSTM-Kriging.
+- [x] **Multi-year data strategy** — 10 years of ERA5 for ENSO coverage; Synoptic 1-year as primary training data (real observations).
+- [x] **ML architecture** — 3-stage pipeline: GBT per variable → LSTM for temp/humidity → spatial interpolation to prediction grid. Not Geo-LSTM-Kriging.
 - [x] **ERA5 role** — Upgraded from background context to primary model input. `boundary_layer_height` and `temp_850hPa` are key fog dynamics features.
+- [x] **Open-Meteo dense grid removed** — Model-interpolated data would teach the model to replicate another model's assumptions. Synoptic stations + terrain features provide sufficient coverage with real observations.
 
 ### Next steps: fill data gaps for Stage 1 GBT
 
@@ -223,29 +205,60 @@ Both the Synoptic API key and a subsequently generated token were exposed in HTT
 | Synoptic lag features (t-1hr, t-3hr, t-6hr) | 1 | Derive during preprocessing |
 | Neighboring station features (distance-weighted mean) | 1 | Derive during preprocessing |
 
+### Station QC: three mechanistically distinct failure modes (2026-03-12)
+
+Automated QC on the 1,124 Synoptic stations identified 41 bad stations (3.6%) via
+physical range thresholds: temp outside [−20, 50]°C, humidity outside [0, 100]%, or
+within-station std > 15°C. Investigation revealed three distinct root causes — not
+undifferentiated noise — each requiring a different response.
+
+**Mode 1 — Hardware failures (excluded):** JEPC1, OAMC1, PRWC1, SFXC1, BINC1,
+GGBC1, PTRCA, and others. Mid-record sensor failures producing physically impossible
+values (temp 1243°C, humidity 4108%). Valid portions of the record are usable in
+principle but indistinguishable from corrupt portions without manual inspection.
+Decision: exclude entirely.
+
+**Mode 2 — ASOS hygrometer over-reads (clipped, kept):** KDVO, KHAF, KRHV, KPAO,
+KSNS, KSQL. Airport ASOS stations with overwhelmingly valid data but rare humidity
+readings of 101–115%. Occurs during coastal fog saturation events when capacitive
+hygrometers saturate slightly above 100%. Affected readings: <2% of station records.
+Decision: clip humidity to [0, 100] in ingestion pipeline. These are valuable stations
+with long, otherwise reliable records.
+
+**Mode 3 — Consistent Fahrenheit submission (investigated, excluded):** UP641, UP657,
+UP667, UP680, UR476, UR481, UR604. Maximum temperatures of 63–110°C consistently
+convert to plausible Bay Area values under (F−32)×5/9. However, cross-month audit
+revealed these stations also produce implausible minimums (−45 to −17°C) that do
+not resolve with Fahrenheit conversion. The Fahrenheit issue co-occurs with
+intermittent sensor glitches, making the record unsalvageable without manual
+per-timestamp unit detection. Decision: exclude entirely.
+
+The QC blocklist lives in `src/build_training_set.py: BAD_STATIONS`. The ASOS clip
+is applied at ingestion in the same file. Net result: 582/623 active stations
+(93.4%) retained after QC.
+
 ### Later stages
 
 | Data | Stage | Status |
 |------|-------|--------|
 | Per-station continuous time series with gap handling | 2 | Derive from chunked Synoptic data |
-| Open-Meteo dense grid (899 pts × 10 years) | 3 | Not run — `YEARS_BACK=10`, ~16 hrs |
-| ERA5 interpolated to 899 grid points | 3 | Derive from existing ERA5 grid |
-| DEM + NLCD at 899 grid points | 3 | Not collected — same sources as Stage 1 |
+| Define prediction grid (regular lat/lon mesh) | 3 | Choose resolution, generate grid points |
+| ERA5 interpolated to prediction grid points | 3 | Derive from existing ERA5 grid |
+| DEM + NLCD at prediction grid points | 3 | Not collected — same sources as Stage 1 |
 
 ### Modeling decisions (after data gaps filled)
 
 - [ ] **Define train/val/test split strategy** — temporal, spatial, or stratified
 - [ ] **Train Stage 1 GBT** — separate models per variable, evaluate feature importance
-- [ ] **Validate Open-Meteo vs. Synoptic ASOS** — bias/RMSE at co-located points (KSFO, KOAK, KSJC)
 - [ ] **Stage 2: LSTM for temp/humidity** — 24hr rolling window, static terrain context
-- [ ] **Stage 3: predict at dense grid, cluster into zones** — microclimate parcellation
+- [ ] **Stage 3: predict at prediction grid, cluster into zones** — microclimate parcellation
 
 ---
 
 ## References
 
 - Han, S. et al. — "Geo-LSTM-Kriging: A spatiotemporal deep learning approach for temperature interpolation." Warsaw mesoscale evaluation: Kriging RMSE 3.0C, R2 0.58. Informed the decision to reject Kriging at neighborhood scale and the absence of vertical atmospheric structure (marine layer height, inversion) as a gap for Bay Area fog modeling.
-- Open-Meteo Archive API — https://open-meteo.com/en/docs/historical-weather-api. Source for ERA5 reanalysis and dense surface grid data. Free, no API key required.
+- Open-Meteo Archive API — https://open-meteo.com/en/docs/historical-weather-api. Source for ERA5 reanalysis data. Free, no API key required.
 - Synoptic Data API — https://docs.synopticdata.com/services/time-series. Source for ground-truth station observations. Free Open Access tier capped at 1 year of history.
 - ERA5 reanalysis (Hersbach et al., 2020) — ECMWF's fifth-generation global atmospheric reanalysis, 0.25 degree resolution. Accessed via Open-Meteo. Key variables: `boundary_layer_height`, `temperature_850hPa`.
 - SRTM 30m DEM — https://earthexplorer.usgs.gov/. Planned source for elevation, slope, aspect terrain features.

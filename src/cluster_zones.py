@@ -70,7 +70,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)s  %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("cluster_zones.log"),
+        logging.FileHandler("logs/cluster_zones.log"),
     ],
 )
 log = logging.getLogger(__name__)

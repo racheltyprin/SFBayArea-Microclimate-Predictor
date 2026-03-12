@@ -83,7 +83,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)s  %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("download_era5.log"),
+        logging.FileHandler("logs/download_era5.log"),
     ],
 )
 log = logging.getLogger(__name__)

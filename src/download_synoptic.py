@@ -71,7 +71,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)s  %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("download_synoptic.log"),
+        logging.FileHandler("logs/download_synoptic.log"),
     ],
 )
 log = logging.getLogger(__name__)

@@ -77,7 +77,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)s  %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("download_openmeteo_dense.log"),
+        logging.FileHandler("logs/download_openmeteo_dense.log"),
     ],
 )
 log = logging.getLogger(__name__)
