@@ -118,24 +118,57 @@ ERA5 values must be spatially interpolated to each Synoptic station location (an
 **Predict variables separately (2026-03-10)**
 One model per target variable (temperature, humidity, wind speed, wind direction, precipitation). Each has different dominant drivers — fog is primarily coastal distance + season, temperature is terrain + land cover, humidity is both. Separate models reveal what's driving each variable. Multi-output architectures are a later optimization, not a starting point.
 
-### Stage 1: GBT per variable [not implemented]
+### Stage 1: GBT per variable [verified, ongoing]
 
-One XGBoost or LightGBM model per target variable. Each model takes a flat feature vector per station-timestep:
+One HistGradientBoostingRegressor model per target variable (LightGBM/XGBoost dropped — `libomp` unavailable on macOS; sklearn HGBR has no OpenMP dependency and natively handles NaN). Each model takes a flat feature vector per station-timestep.
 
 **Observation features:**
 - Synoptic lag values for that station (t-1hr, t-3hr, t-6hr)
-- Neighboring station values (distance-weighted mean of nearest N stations)
+- Neighboring station values (mean of 5 nearest stations)
 
 **ERA5 features interpolated to station location:**
 - `boundary_layer_height` — most important feature for fog dynamics
-- `temp_850hPa` — captures inversion strength
 - `cloud_cover`, `pressure`, wind components
+- `elev_above_blh_m` — derived: station elevation minus BLH. Positive = above inversion. Top-15 feature for both temp and humidity.
+- `aspect_northness` — cos(aspect_deg), encodes north-facing exposure
+- `northness_x_blh_deficit` — interaction: north-facing exposure × distance below inversion
 
 **Static terrain features per station:**
-- Elevation, coastal distance, slope aspect (from DEM)
-- Land cover type — urban/vegetation/water (from NLCD)
+- Elevation, coastal distance, slope, aspect (from SRTM via Open-Meteo Elevation API)
+- Land cover type — urban/vegetation/water (from NLCD 2021 via MRLC WMS)
 
-This stage tells us which features matter per variable and gives a strong baseline RMSE.
+**Results (v2 models, Feb–Mar 2026 test set):**
+
+| Variable | RMSE | R² | vs ERA5 direct | vs persistence |
+|---|---|---|---|---|
+| temp_c | 0.709°C | 0.978 | −71% RMSE | −38% RMSE |
+| humidity | 4.303% | 0.949 | −72% RMSE | −19% RMSE |
+| wind_speed_kph | 2.999 kph | 0.814 | — | — |
+| wind_dir_deg | 54.6° | 0.630 | — | — |
+| precip_mm | 21.7 mm | 0.995 | — | — |
+
+Models saved to `models/stage1_v2/`. v1 models (without inversion features) retained at `models/stage1/` for comparison. Training data at `features/training_v2/` (S3); v1 data retained at `features/training/`.
+
+**Known limitation:** Ridge stations near the marine layer inversion boundary (e.g. F2543, Twin Peaks, elev 152m) show elevated humidity error (RMSE 21.8%) even after adding `elev_above_blh_m`. The GBT cannot fully learn the sharp inversion boundary from a smooth training set. This is a Stage 3 spatial interpolation problem — once ridge stations anchor their own microclimate zone rather than being averaged with lower-elevation neighbors, this should resolve.
+
+**Status note (2026-03-16):** Stage 1 is functionally complete and producing valid results, but accuracy improvements are ongoing. Feature engineering iterations (e.g. inversion height features added in v2) will continue as new physical signals are identified. The v1/v2 model split is retained in `models/stage1/` and `models/stage1_v2/` to support before/after comparison as further changes are made.
+
+**Identified improvement opportunities (2026-03-16):**
+
+_High impact:_
+- **Increase training data cap** — `MAX_TRAIN_SAMPLES=500K` discards ~85% of available data. HGBR handles large datasets; raise to 2M+ or remove cap.
+- **Hyperparameter tuning** — current params are untouched defaults. Lower LR (0.01) + more iterations (2000+), and sweep `max_leaf_nodes`/`max_depth`/`min_samples_leaf`.
+- **Distance-weighted neighbor features** — current unweighted mean treats a 0.5km neighbor the same as 15km. Inverse-distance weighting is more physical.
+- **Clip humidity predictions** — 2.4% out of [0,100] bounds. Post-prediction clip or HGBR `monotonic_cst`.
+
+_Medium impact:_
+- **Wind direction decomposition** — worst-performing variable (RMSE 54.6°, R² 0.630). Decompose into u/v components, train two models, reconstruct via atan2. Applies to target and lag/ERA5 wind features.
+- **Neighbor spread features** — add `neighbor_std_{var}` alongside mean. High spread signals microclimate boundaries (e.g., fog edge).
+- **Coastal distance × BLH interaction** — encodes "how far inland does the marine layer reach right now."
+
+_Lower priority:_
+- **Lag feature gap handling** — `shift(lag_h)` assumes consecutive hourly rows; stations with gaps get incorrect lags.
+- **Per-variable model params** — precip (skewed, mostly zero) and wind_dir (circular) need different configs than temp/humidity.
 
 ### Stage 2: LSTM for temperature and humidity [not implemented]
 
@@ -194,16 +227,16 @@ Both the Synoptic API key and a subsequently generated token were exposed in HTT
 - [x] **ERA5 role** — Upgraded from background context to primary model input. `boundary_layer_height` and `temp_850hPa` are key fog dynamics features.
 - [x] **Open-Meteo dense grid removed** — Model-interpolated data would teach the model to replicate another model's assumptions. Synoptic stations + terrain features provide sufficient coverage with real observations.
 
-### Next steps: fill data gaps for Stage 1 GBT
+### Stage 1 data gaps (all resolved)
 
 | Data | Stage | Status |
 |------|-------|--------|
-| Complete Synoptic chunks 18–22 (5/month × 13 months) | 1 | Missing — run `download_synoptic.py` to completion |
-| ERA5 → Synoptic station interpolation | 1 | Derive from existing ERA5 grid (bilinear interp to each station lat/lon) |
-| DEM terrain features at stations (elevation, slope, aspect) | 1 | Not collected — pull from SRTM 30m or USGS 3DEP |
-| NLCD land cover at stations (urban/vegetation/water) | 1 | Not collected — pull from NLCD |
-| Synoptic lag features (t-1hr, t-3hr, t-6hr) | 1 | Derive during preprocessing |
-| Neighboring station features (distance-weighted mean) | 1 | Derive during preprocessing |
+| Complete Synoptic chunks | 1 | Done — 13 months, ~23 chunks/month |
+| ERA5 → Synoptic station interpolation | 1 | Done — bilinear interp, `features/era5_at_stations/` |
+| DEM terrain features at stations (elevation, slope, aspect) | 1 | Done — Open-Meteo Elevation API, `features/static/terrain_features.parquet` |
+| NLCD land cover at stations | 1 | Done — MRLC WMS GetFeatureInfo, `features/static/land_cover.parquet` |
+| Synoptic lag features (t-1hr, t-3hr, t-6hr) | 1 | Done — computed in `build_training_set.py` |
+| Neighboring station features (mean of 5 nearest) | 1 | Done — vectorized pivot approach in `build_training_set.py` |
 
 ### Station QC: three mechanistically distinct failure modes (2026-03-12)
 
@@ -248,8 +281,8 @@ is applied at ingestion in the same file. Net result: 582/623 active stations
 
 ### Modeling decisions (after data gaps filled)
 
-- [ ] **Define train/val/test split strategy** — temporal, spatial, or stratified
-- [ ] **Train Stage 1 GBT** — separate models per variable, evaluate feature importance
+- [x] **Define train/val/test split strategy** — temporal split: last 2 months (Feb–Mar 2026) as test, remainder as train
+- [x] **Train Stage 1 GBT** — separate models per variable, evaluated with baseline comparison, spatial/temporal error, cold-start, fog stratification, and climatological plausibility checks
 - [ ] **Stage 2: LSTM for temp/humidity** — 24hr rolling window, static terrain context
 - [ ] **Stage 3: predict at prediction grid, cluster into zones** — microclimate parcellation
 

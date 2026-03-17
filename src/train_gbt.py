@@ -14,7 +14,7 @@ S3 layout:
     Input:
         features/training/YYYY-MM.parquet
     Output:
-        models/stage1/{variable}_model.joblib  (local)
+        models/stage1_v2/{variable}_model.joblib  (local)
 """
 
 import os
@@ -116,10 +116,10 @@ def get_feature_columns(columns: list[str], target: str) -> list[str]:
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    os.makedirs("models/stage1", exist_ok=True)
+    os.makedirs("models/stage1_v2", exist_ok=True)
 
     # Discover training files and determine train/test split
-    train_keys = sorted(list_s3_keys("features/training/"))
+    train_keys = sorted(list_s3_keys("features/training_v2/"))
     if not train_keys:
         log.error("No training data found. Run build_training_set.py first.")
         return
@@ -243,12 +243,12 @@ def main():
             log.info(f"    {row['feature']:40s}  {row['importance']:.4f}")
 
         # Save model
-        model_path = f"models/stage1/{target}_model.joblib"
+        model_path = f"models/stage1_v2/{target}_model.joblib"
         joblib.dump({"model": model, "features": valid_features}, model_path)
         log.info(f"  Saved model to {model_path}")
 
         # Save feature importance
-        importance.to_csv(f"models/stage1/{target}_importance.csv", index=False)
+        importance.to_csv(f"models/stage1_v2/{target}_importance.csv", index=False)
 
         # Free memory before next variable
         del X_train, y_train, X_test, y_test, y_pred, model

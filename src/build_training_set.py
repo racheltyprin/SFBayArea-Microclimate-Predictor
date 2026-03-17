@@ -36,7 +36,7 @@ from src.utils import upload_df_to_s3, s3_key_exists, S3_BUCKET
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-S3_PREFIX = "features/training"
+S3_PREFIX = "features/training_v2"
 
 # Target variables from Synoptic observations
 TARGET_VARS = ["temp_c", "humidity", "wind_speed_kph", "wind_dir_deg", "precip_mm"]
@@ -324,6 +324,22 @@ def main():
         drop_cols = [c for c in merged.columns if c.endswith("_static")]
         if drop_cols:
             merged = merged.drop(columns=drop_cols)
+
+        # Derived inversion features (require both ERA5 BLH and static elevation)
+        # elev_above_blh_m: positive = station above marine layer inversion,
+        #                   negative = station within marine layer
+        if "boundary_layer_height_m" in merged.columns and "elev_m" in merged.columns:
+            merged["elev_above_blh_m"] = merged["elev_m"] - merged["boundary_layer_height_m"]
+
+            # Northness: cos(aspect) maps 0°(N)→1, 90°(E)→0, 180°(S)→-1, 270°(W)→0
+            if "aspect_deg" in merged.columns:
+                merged["aspect_northness"] = np.cos(np.radians(merged["aspect_deg"]))
+                # Interaction: north-facing exposure conditional on being near the inversion.
+                # Positive when north-facing and below inversion (fog retention),
+                # negative when north-facing and above inversion.
+                merged["northness_x_blh_deficit"] = (
+                    merged["aspect_northness"] * (merged["boundary_layer_height_m"] - merged["elev_m"])
+                )
 
         # Upload
         upload_df_to_s3(merged, out_key, log)

@@ -8,7 +8,7 @@ Runs five evaluations:
   4. Cold-start: GBT without lag features (spatial-only, simulates stale observations)
   5. Fog-event performance: errors stratified by boundary_layer_height_m quartile
 
-Prints a concise report and saves CSV results to models/stage1/eval/.
+Prints a concise report and saves CSV results to models/stage1_v2/eval/.
 
 Usage:
     python src/evaluate_stage1.py
@@ -81,13 +81,13 @@ def mae(y_true, y_pred):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    os.makedirs("models/stage1/eval", exist_ok=True)
+    os.makedirs("models/stage1_v2/eval", exist_ok=True)
 
     # Load test data
     log.info("Loading test data...")
     frames = []
     for month in TEST_MONTHS:
-        key = f"features/training/{month}.parquet"
+        key = f"features/training_v2/{month}.parquet"
         try:
             df = load_parquet_from_s3(key)
             df["month"] = month
@@ -111,7 +111,7 @@ def main():
         log.info(f"{'='*65}")
 
         # Load model
-        model_path = f"models/stage1/{var}_model.joblib"
+        model_path = f"models/stage1_v2/{var}_model.joblib"
         if not os.path.exists(model_path):
             log.error(f"  Model not found: {model_path}")
             continue
@@ -162,7 +162,7 @@ def main():
                                    "rmse": r, "mae": m, "r2": r2_val})
 
         pd.DataFrame(baseline_rows).to_csv(
-            f"models/stage1/eval/{var}_baselines.csv", index=False)
+            f"models/stage1_v2/eval/{var}_baselines.csv", index=False)
 
         skill_score = 1 - rmse(y_true, y_gbt) / rmse(y_true, y_persist)
         log.info(f"\n  Skill score vs persistence: {skill_score:.3f}  "
@@ -177,6 +177,7 @@ def main():
                         .groupby("stid")
                         .apply(lambda g: pd.Series({
                             "rmse": rmse(g["y_true"].values, g["y_pred"].values),
+                            "r2": r2(g["y_true"].values, g["y_pred"].values),
                             "n": len(g),
                             "lat": g["lat"].iloc[0] if "lat" in g.columns else np.nan,
                             "lon": g["lon"].iloc[0] if "lon" in g.columns else np.nan,
@@ -186,16 +187,16 @@ def main():
                         .dropna(subset=["rmse"])
                         .sort_values("rmse", ascending=False))
 
-        log.info(f"  {'Station':<12s}  {'RMSE':>8s}  {'N':>6s}  {'Dist Coast':>10s}")
-        log.info(f"  {'-'*42}")
+        log.info(f"  {'Station':<12s}  {'RMSE':>8s}  {'R2':>8s}  {'N':>6s}  {'Dist Coast':>10s}")
+        log.info(f"  {'-'*54}")
         log.info(f"  -- Worst 10 --")
         for _, row in station_rmse.head(10).iterrows():
-            log.info(f"  {row['stid']:<12s}  {row['rmse']:>8.3f}  {int(row['n']):>6d}  {row['dist_coast_km']:>10.1f}")
+            log.info(f"  {row['stid']:<12s}  {row['rmse']:>8.3f}  {row['r2']:>8.3f}  {int(row['n']):>6d}  {row['dist_coast_km']:>10.1f}")
         log.info(f"  -- Best 10 --")
         for _, row in station_rmse.tail(10).iterrows():
-            log.info(f"  {row['stid']:<12s}  {row['rmse']:>8.3f}  {int(row['n']):>6d}  {row['dist_coast_km']:>10.1f}")
+            log.info(f"  {row['stid']:<12s}  {row['rmse']:>8.3f}  {row['r2']:>8.3f}  {int(row['n']):>6d}  {row['dist_coast_km']:>10.1f}")
 
-        station_rmse.to_csv(f"models/stage1/eval/{var}_station_rmse.csv", index=False)
+        station_rmse.to_csv(f"models/stage1_v2/eval/{var}_station_rmse.csv", index=False)
 
         # Correlation: does RMSE correlate with coastal distance?
         corr = station_rmse[["rmse", "dist_coast_km"]].dropna().corr().iloc[0, 1]
@@ -214,7 +215,7 @@ def main():
         best_hour = hourly.loc[hourly["rmse"].idxmin()]
         log.info(f"  Best hour:  {int(best_hour['hour']):02d}:00  RMSE={best_hour['rmse']:.4f}")
         log.info(f"  Worst hour: {int(worst_hour['hour']):02d}:00  RMSE={worst_hour['rmse']:.4f}")
-        hourly.to_csv(f"models/stage1/eval/{var}_hourly_rmse.csv", index=False)
+        hourly.to_csv(f"models/stage1_v2/eval/{var}_hourly_rmse.csv", index=False)
 
         # ── 4. Cold-start: no lag features ───────────────────────────────────
         log.info("\n4. Cold-start performance (no lag features):")
@@ -248,7 +249,7 @@ def main():
             "cold_start_rmse": cold_rmse,
             "degradation_factor": cold_rmse / full_rmse,
             "clim_rmse": rmse(y_true, y_clim),
-        }]).to_csv(f"models/stage1/eval/{var}_cold_start.csv", index=False)
+        }]).to_csv(f"models/stage1_v2/eval/{var}_cold_start.csv", index=False)
 
         # ── 5. Fog-event performance ─────────────────────────────────────────
         log.info("\n5. Fog-event performance (stratified by BLH quartile):")
@@ -279,12 +280,65 @@ def main():
                                   "n": n, "rmse": r_val, "r2": r2_val})
 
             pd.DataFrame(fog_rows).to_csv(
-                f"models/stage1/eval/{var}_fog_strata.csv", index=False)
+                f"models/stage1_v2/eval/{var}_fog_strata.csv", index=False)
         else:
             log.warning("  boundary_layer_height_m not found in test data")
 
+        # ── 6. Climatological plausibility check ─────────────────────────────
+        log.info("\n6. Climatological plausibility check:")
+
+        # Bay Area physical bounds (hard limits -- values outside are physically impossible)
+        PLAUSIBILITY_BOUNDS = {
+            "temp_c":          (-5.0,  45.0),
+            "humidity":        (0.0,  100.0),
+            "wind_speed_kph":  (0.0,  120.0),
+            "wind_dir_deg":    (0.0,  360.0),
+            "precip_mm":       (0.0,   50.0),
+        }
+
+        lo, hi = PLAUSIBILITY_BOUNDS.get(var, (-np.inf, np.inf))
+        n_total = len(y_gbt)
+        n_out_lo = int(np.sum(y_gbt < lo))
+        n_out_hi = int(np.sum(y_gbt > hi))
+        n_out = n_out_lo + n_out_hi
+        pct_out = 100.0 * n_out / n_total if n_total > 0 else 0.0
+
+        log.info(f"  Physical bounds: [{lo}, {hi}]")
+        log.info(f"  Predictions out of bounds: {n_out:,} / {n_total:,}  ({pct_out:.3f}%)")
+        if n_out_lo:
+            log.info(f"    Below {lo}: {n_out_lo:,}  (min predicted = {y_gbt.min():.3f})")
+        if n_out_hi:
+            log.info(f"    Above {hi}: {n_out_hi:,}  (max predicted = {y_gbt.max():.3f})")
+
+        # Distribution comparison: predicted vs observed
+        log.info(f"\n  Distribution comparison (predicted vs observed):")
+        stats_rows = []
+        for label, vals in [("Observed", y_true), ("Predicted", y_gbt)]:
+            mask_v = ~np.isnan(vals)
+            v = vals[mask_v]
+            p5, p25, p50, p75, p95 = np.percentile(v, [5, 25, 50, 75, 95])
+            log.info(f"  {label:<12s}  mean={np.mean(v):>7.3f}  std={np.std(v):>6.3f}  "
+                     f"p5={p5:>7.3f}  p25={p25:>7.3f}  p50={p50:>7.3f}  "
+                     f"p75={p75:>7.3f}  p95={p95:>7.3f}")
+            stats_rows.append({
+                "variable": var, "split": label,
+                "mean": np.mean(v), "std": np.std(v),
+                "p5": p5, "p25": p25, "p50": p50, "p75": p75, "p95": p95,
+                "n_out_of_bounds": n_out if label == "Predicted" else 0,
+                "pct_out_of_bounds": pct_out if label == "Predicted" else 0.0,
+            })
+
+        # Bias check
+        valid_mask = ~(np.isnan(y_true) | np.isnan(y_gbt))
+        bias = float(np.mean(y_gbt[valid_mask] - y_true[valid_mask]))
+        log.info(f"\n  Mean bias (predicted - observed): {bias:+.4f}  "
+                 f"({'over-predict' if bias > 0 else 'under-predict'})")
+
+        pd.DataFrame(stats_rows).to_csv(
+            f"models/stage1_v2/eval/{var}_plausibility.csv", index=False)
+
     log.info(f"\n{'='*65}")
-    log.info("Evaluation complete. Results in models/stage1/eval/")
+    log.info("Evaluation complete. Results in models/stage1_v2/eval/")
     log.info(f"{'='*65}")
 
 
