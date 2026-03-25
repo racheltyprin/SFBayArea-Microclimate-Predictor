@@ -8,7 +8,7 @@ Runs five evaluations:
   4. Cold-start: GBT without lag features (spatial-only, simulates stale observations)
   5. Fog-event performance: errors stratified by boundary_layer_height_m quartile
 
-Prints a concise report and saves CSV results to models/stage1_v2/eval/.
+Prints a concise report and saves CSV results to models/stage1_v3/eval/.
 
 Usage:
     python src/evaluate_stage1.py
@@ -81,13 +81,13 @@ def mae(y_true, y_pred):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    os.makedirs("models/stage1_v2/eval", exist_ok=True)
+    os.makedirs("models/stage1_v3/eval", exist_ok=True)
 
     # Load test data
     log.info("Loading test data...")
     frames = []
     for month in TEST_MONTHS:
-        key = f"features/training_v2/{month}.parquet"
+        key = f"features/training_v3/{month}.parquet"
         try:
             df = load_parquet_from_s3(key)
             df["month"] = month
@@ -111,7 +111,7 @@ def main():
         log.info(f"{'='*65}")
 
         # Load model
-        model_path = f"models/stage1_v2/{var}_model.joblib"
+        model_path = f"models/stage1_v3/{var}_model.joblib"
         if not os.path.exists(model_path):
             log.error(f"  Model not found: {model_path}")
             continue
@@ -131,6 +131,10 @@ def main():
         valid_features = [f for f in features if f in valid.columns]
         X = valid[valid_features].values.astype(np.float32)
         y_gbt = model.predict(X)
+
+        # Clip humidity predictions to physical bounds [0, 100]
+        if var == "humidity":
+            y_gbt = np.clip(y_gbt, 0.0, 100.0)
 
         # Persistence baseline (1h lag)
         lag_col = f"{var}_lag1h"
@@ -162,7 +166,7 @@ def main():
                                    "rmse": r, "mae": m, "r2": r2_val})
 
         pd.DataFrame(baseline_rows).to_csv(
-            f"models/stage1_v2/eval/{var}_baselines.csv", index=False)
+            f"models/stage1_v3/eval/{var}_baselines.csv", index=False)
 
         skill_score = 1 - rmse(y_true, y_gbt) / rmse(y_true, y_persist)
         log.info(f"\n  Skill score vs persistence: {skill_score:.3f}  "
@@ -196,7 +200,7 @@ def main():
         for _, row in station_rmse.tail(10).iterrows():
             log.info(f"  {row['stid']:<12s}  {row['rmse']:>8.3f}  {row['r2']:>8.3f}  {int(row['n']):>6d}  {row['dist_coast_km']:>10.1f}")
 
-        station_rmse.to_csv(f"models/stage1_v2/eval/{var}_station_rmse.csv", index=False)
+        station_rmse.to_csv(f"models/stage1_v3/eval/{var}_station_rmse.csv", index=False)
 
         # Correlation: does RMSE correlate with coastal distance?
         corr = station_rmse[["rmse", "dist_coast_km"]].dropna().corr().iloc[0, 1]
@@ -215,7 +219,7 @@ def main():
         best_hour = hourly.loc[hourly["rmse"].idxmin()]
         log.info(f"  Best hour:  {int(best_hour['hour']):02d}:00  RMSE={best_hour['rmse']:.4f}")
         log.info(f"  Worst hour: {int(worst_hour['hour']):02d}:00  RMSE={worst_hour['rmse']:.4f}")
-        hourly.to_csv(f"models/stage1_v2/eval/{var}_hourly_rmse.csv", index=False)
+        hourly.to_csv(f"models/stage1_v3/eval/{var}_hourly_rmse.csv", index=False)
 
         # ── 4. Cold-start: no lag features ───────────────────────────────────
         log.info("\n4. Cold-start performance (no lag features):")
@@ -249,7 +253,7 @@ def main():
             "cold_start_rmse": cold_rmse,
             "degradation_factor": cold_rmse / full_rmse,
             "clim_rmse": rmse(y_true, y_clim),
-        }]).to_csv(f"models/stage1_v2/eval/{var}_cold_start.csv", index=False)
+        }]).to_csv(f"models/stage1_v3/eval/{var}_cold_start.csv", index=False)
 
         # ── 5. Fog-event performance ─────────────────────────────────────────
         log.info("\n5. Fog-event performance (stratified by BLH quartile):")
@@ -280,7 +284,7 @@ def main():
                                   "n": n, "rmse": r_val, "r2": r2_val})
 
             pd.DataFrame(fog_rows).to_csv(
-                f"models/stage1_v2/eval/{var}_fog_strata.csv", index=False)
+                f"models/stage1_v3/eval/{var}_fog_strata.csv", index=False)
         else:
             log.warning("  boundary_layer_height_m not found in test data")
 
@@ -335,10 +339,45 @@ def main():
                  f"({'over-predict' if bias > 0 else 'under-predict'})")
 
         pd.DataFrame(stats_rows).to_csv(
-            f"models/stage1_v2/eval/{var}_plausibility.csv", index=False)
+            f"models/stage1_v3/eval/{var}_plausibility.csv", index=False)
+
+    # ── Wind direction: reconstruct from u/v models and evaluate ─────────────
+    log.info(f"\n{'='*65}")
+    log.info("Wind direction (reconstructed from wind_dir_u / wind_dir_v models)")
+    log.info(f"{'='*65}")
+
+    u_path = "models/stage1_v3/wind_dir_u_model.joblib"
+    v_path = "models/stage1_v3/wind_dir_v_model.joblib"
+    if os.path.exists(u_path) and os.path.exists(v_path) and "wind_dir_deg" in data.columns:
+        u_bundle = joblib.load(u_path)
+        v_bundle = joblib.load(v_path)
+
+        valid_wd = data.dropna(subset=["wind_dir_deg"]).copy()
+        y_true_deg = valid_wd["wind_dir_deg"].values
+
+        u_feats = [f for f in u_bundle["features"] if f in valid_wd.columns]
+        v_feats = [f for f in v_bundle["features"] if f in valid_wd.columns]
+        u_pred = u_bundle["model"].predict(valid_wd[u_feats].values.astype(np.float32))
+        v_pred = v_bundle["model"].predict(valid_wd[v_feats].values.astype(np.float32))
+
+        # Reconstruct angle from unit vector predictions
+        y_pred_deg = (np.degrees(np.arctan2(-u_pred, -v_pred))) % 360
+
+        # Circular RMSE: shortest angular distance between predicted and observed
+        diff = np.abs(y_pred_deg - y_true_deg)
+        diff = np.minimum(diff, 360 - diff)
+        circ_rmse = float(np.sqrt(np.mean(diff ** 2)))
+        circ_mae = float(np.mean(diff))
+        log.info(f"  Circular RMSE: {circ_rmse:.2f}°   Circular MAE: {circ_mae:.2f}°")
+        log.info(f"  (v2 raw angle RMSE was 54.6° for reference)")
+
+        pd.DataFrame([{"circ_rmse": circ_rmse, "circ_mae": circ_mae}]).to_csv(
+            "models/stage1_v3/eval/wind_dir_circular.csv", index=False)
+    else:
+        log.warning("  wind_dir_u/v models not found or wind_dir_deg missing from test data")
 
     log.info(f"\n{'='*65}")
-    log.info("Evaluation complete. Results in models/stage1_v2/eval/")
+    log.info("Evaluation complete. Results in models/stage1_v3/eval/")
     log.info(f"{'='*65}")
 
 

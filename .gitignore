@@ -23,3 +23,6 @@ venv/
 # Data files — stored in S3, not git
 *.parquet
 *.csv
+
+# Personal Information
+DECISIONS.md

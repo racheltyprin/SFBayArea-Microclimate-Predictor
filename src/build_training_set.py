@@ -36,7 +36,7 @@ from src.utils import upload_df_to_s3, s3_key_exists, S3_BUCKET
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-S3_PREFIX = "features/training_v2"
+S3_PREFIX = "features/training_v3"
 
 # Target variables from Synoptic observations
 TARGET_VARS = ["temp_c", "humidity", "wind_speed_kph", "wind_dir_deg", "precip_mm"]
@@ -109,10 +109,10 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return R * 2 * np.arcsin(np.sqrt(a))
 
 
-def build_neighbor_map(stations: pd.DataFrame, n: int) -> dict[str, list[str]]:
+def build_neighbor_map(stations: pd.DataFrame, n: int) -> dict[str, list[tuple]]:
     """
     For each station, find the N nearest neighbors by haversine distance.
-    Returns {stid: [neighbor_stid_1, ..., neighbor_stid_n]}.
+    Returns {stid: [(neighbor_stid, dist_km), ...]}.
     """
     lats = stations["lat"].values
     lons = stations["lon"].values
@@ -121,9 +121,8 @@ def build_neighbor_map(stations: pd.DataFrame, n: int) -> dict[str, list[str]]:
     neighbor_map = {}
     for i in range(len(stids)):
         dists = haversine_km(lats[i], lons[i], lats, lons)
-        # Exclude self (distance 0), sort by distance
         idx = np.argsort(dists)
-        neighbors = [stids[j] for j in idx[1:n + 1]]
+        neighbors = [(stids[j], float(dists[j])) for j in idx[1:n + 1]]
         neighbor_map[stids[i]] = neighbors
 
     return neighbor_map
@@ -146,15 +145,19 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
 def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add lagged observation values for each target variable.
-    Operates per-station after sorting by time.
+    Gap-aware: validates that the shifted timestamp matches the expected lag
+    duration. Stations with missing hours get NaN rather than the wrong value.
     """
     df = df.sort_values(["stid", "datetime"])
 
     for var in TARGET_VARS:
         for lag_h in LAG_HOURS:
             col_name = f"{var}_lag{lag_h}h"
-            # Shift by lag_h rows (each row is 1 hour after rounding)
-            df[col_name] = df.groupby("stid")[var].shift(lag_h)
+            shifted_vals = df.groupby("stid")[var].shift(lag_h)
+            shifted_times = df.groupby("stid")["datetime"].shift(lag_h)
+            expected_times = df["datetime"] - pd.Timedelta(hours=lag_h)
+            valid = (shifted_times - expected_times).abs() <= pd.Timedelta(minutes=5)
+            df[col_name] = shifted_vals.where(valid)
 
     return df
 
@@ -292,27 +295,53 @@ def main():
         merged = add_lag_features(merged)
         log.info(f"    Added lag features")
 
-        # Add neighbor features (expensive -- use vectorized approach for speed)
+        # Add wind direction u/v components (circular-safe representation).
+        # Applied to current obs and all lag columns so the model never sees
+        # raw degrees (which wrap at 360°).
+        for suffix in [""] + [f"_lag{h}h" for h in LAG_HOURS]:
+            dir_col = f"wind_dir_deg{suffix}"
+            if dir_col in merged.columns:
+                rad = np.radians(merged[dir_col])
+                merged[f"wind_u{suffix}"] = -np.sin(rad)   # eastward component
+                merged[f"wind_v{suffix}"] = -np.cos(rad)   # northward component
+
+        # ERA5 wind vector components
+        if "wind_dir_10m_deg" in merged.columns and "wind_speed_10m_kph" in merged.columns:
+            rad = np.radians(merged["wind_dir_10m_deg"])
+            merged["era5_wind_u"] = -merged["wind_speed_10m_kph"] * np.sin(rad)
+            merged["era5_wind_v"] = -merged["wind_speed_10m_kph"] * np.cos(rad)
+
+        # Add neighbor features (inverse-distance weighted mean + spread).
+        # Spread (std across neighbors) signals microclimate boundaries --
+        # high spread = station sits near a fog edge or thermal gradient.
         log.info(f"    Computing neighbor features...")
-        # Vectorized neighbor approach: pivot then lookup
         for var in ["temp_c", "humidity"]:
             pivot = merged.pivot_table(index="datetime", columns="stid",
                                        values=var, aggfunc="first")
             neighbor_means = {}
+            neighbor_stds = {}
             for stid, neighbors in neighbor_map.items():
-                valid_neighbors = [n for n in neighbors if n in pivot.columns]
-                if valid_neighbors:
-                    neighbor_means[stid] = pivot[valid_neighbors].mean(axis=1)
+                valid = [(n, d) for n, d in neighbors if n in pivot.columns]
+                if valid:
+                    n_stids = [n for n, d in valid]
+                    # Inverse-distance weights; floor at 0.1km to avoid div-by-zero
+                    weights = np.array([1.0 / max(d, 0.1) for n, d in valid])
+                    weights /= weights.sum()
+                    neighbor_means[stid] = (pivot[n_stids] * weights).sum(axis=1)
+                    neighbor_stds[stid] = pivot[n_stids].std(axis=1)
                 else:
                     neighbor_means[stid] = pd.Series(np.nan, index=pivot.index)
+                    neighbor_stds[stid] = pd.Series(np.nan, index=pivot.index)
 
-            neighbor_df = pd.DataFrame(neighbor_means)
-            neighbor_melted = (neighbor_df.stack()
-                               .reset_index()
-                               .rename(columns={"level_0": "datetime",
-                                                "level_1": "stid",
-                                                0: f"neighbor_mean_{var}"}))
-            merged = merged.merge(neighbor_melted, on=["stid", "datetime"], how="left")
+            for col_name, data in [(f"neighbor_mean_{var}", neighbor_means),
+                                   (f"neighbor_std_{var}", neighbor_stds)]:
+                df_wide = pd.DataFrame(data)
+                df_melted = (df_wide.stack()
+                             .reset_index()
+                             .rename(columns={"level_0": "datetime",
+                                              "level_1": "stid",
+                                              0: col_name}))
+                merged = merged.merge(df_melted, on=["stid", "datetime"], how="left")
 
         log.info(f"    Added neighbor features")
 
@@ -339,6 +368,13 @@ def main():
                 # negative when north-facing and above inversion.
                 merged["northness_x_blh_deficit"] = (
                     merged["aspect_northness"] * (merged["boundary_layer_height_m"] - merged["elev_m"])
+                )
+
+            # Coastal distance × BLH: encodes how far inland the marine layer
+            # currently reaches. High BLH + low dist_coast = deep fog penetration.
+            if "dist_coast_km" in merged.columns:
+                merged["dist_coast_x_blh"] = (
+                    merged["dist_coast_km"] * merged["boundary_layer_height_m"]
                 )
 
         # Upload

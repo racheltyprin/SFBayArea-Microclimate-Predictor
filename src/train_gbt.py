@@ -14,7 +14,7 @@ S3 layout:
     Input:
         features/training/YYYY-MM.parquet
     Output:
-        models/stage1_v2/{variable}_model.joblib  (local)
+        models/stage1_v3/{variable}_model.joblib  (local)
 """
 
 import os
@@ -36,33 +36,46 @@ from src.utils import S3_BUCKET
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-TARGET_VARS = ["temp_c", "humidity", "wind_speed_kph", "wind_dir_deg", "precip_mm"]
+TARGET_VARS = ["temp_c", "humidity", "wind_speed_kph", "wind_dir_u", "wind_dir_v", "precip_mm"]
 
-# Feature columns to exclude (targets, join keys, metadata)
+# Feature columns to exclude (targets, join keys, metadata).
+# wind_dir_deg is excluded because it is replaced by wind_dir_u/v targets.
 EXCLUDE_COLS = [
     "datetime", "stid", "name", "network", "source",
     "nlcd_code", "nlcd_name", "month",
+    "wind_dir_deg",
 ] + TARGET_VARS
 
 # Time-based train/test split: last 2 months = test
 TEST_MONTHS = 2
 
-# Max training samples to avoid OOM (subsample if larger)
-MAX_TRAIN_SAMPLES = 500_000
+# Training sample cap. None = use all data.
+# HGBR handles large datasets well; removing the previous 500K cap.
+MAX_TRAIN_SAMPLES = None
 
-# HistGradientBoostingRegressor parameters
+# Default HistGradientBoostingRegressor parameters.
+# Lower LR + more iterations generalises better with larger training sets.
 MODEL_PARAMS = {
-    "learning_rate": 0.05,
-    "max_iter": 500,
+    "learning_rate": 0.01,
+    "max_iter": 2000,
     "max_leaf_nodes": 63,
     "max_depth": 8,
     "min_samples_leaf": 20,
     "l2_regularization": 1.0,
     "early_stopping": True,
-    "n_iter_no_change": 30,
+    "n_iter_no_change": 50,
     "validation_fraction": 0.1,
     "random_state": 42,
     "verbose": 0,
+}
+
+# Per-variable overrides applied on top of MODEL_PARAMS.
+# precip_mm: heavily zero-inflated, needs stronger regularisation and shallower trees.
+# wind_dir_u/v: unit vectors in [-1, 1], benefit from tighter leaf size.
+MODEL_PARAM_OVERRIDES = {
+    "precip_mm": {"max_depth": 6, "max_leaf_nodes": 31, "l2_regularization": 5.0},
+    "wind_dir_u": {"min_samples_leaf": 30},
+    "wind_dir_v": {"min_samples_leaf": 30},
 }
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -116,10 +129,10 @@ def get_feature_columns(columns: list[str], target: str) -> list[str]:
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    os.makedirs("models/stage1_v2", exist_ok=True)
+    os.makedirs("models/stage1_v3", exist_ok=True)
 
     # Discover training files and determine train/test split
-    train_keys = sorted(list_s3_keys("features/training_v2/"))
+    train_keys = sorted(list_s3_keys("features/training_v3/"))
     if not train_keys:
         log.error("No training data found. Run build_training_set.py first.")
         return
@@ -175,8 +188,8 @@ def main():
         # Drop NaN targets
         train_df = train_df.dropna(subset=[target])
 
-        # Subsample if too large
-        if len(train_df) > MAX_TRAIN_SAMPLES:
+        # Subsample if cap is set
+        if MAX_TRAIN_SAMPLES is not None and len(train_df) > MAX_TRAIN_SAMPLES:
             log.info(f"  Subsampling train: {len(train_df):,} -> {MAX_TRAIN_SAMPLES:,}")
             train_df = train_df.sample(n=MAX_TRAIN_SAMPLES, random_state=42)
 
@@ -208,8 +221,9 @@ def main():
 
         log.info(f"  Test: {len(X_test):,} rows")
 
-        # Train
-        model = HistGradientBoostingRegressor(**MODEL_PARAMS)
+        # Train (apply any per-variable parameter overrides)
+        params = {**MODEL_PARAMS, **MODEL_PARAM_OVERRIDES.get(target, {})}
+        model = HistGradientBoostingRegressor(**params)
         model.fit(X_train, y_train)
 
         # Evaluate
@@ -243,12 +257,12 @@ def main():
             log.info(f"    {row['feature']:40s}  {row['importance']:.4f}")
 
         # Save model
-        model_path = f"models/stage1_v2/{target}_model.joblib"
+        model_path = f"models/stage1_v3/{target}_model.joblib"
         joblib.dump({"model": model, "features": valid_features}, model_path)
         log.info(f"  Saved model to {model_path}")
 
         # Save feature importance
-        importance.to_csv(f"models/stage1_v2/{target}_importance.csv", index=False)
+        importance.to_csv(f"models/stage1_v3/{target}_importance.csv", index=False)
 
         # Free memory before next variable
         del X_train, y_train, X_test, y_test, y_pred, model
